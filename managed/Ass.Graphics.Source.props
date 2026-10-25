@@ -1,0 +1,23 @@
+<Project>
+  <!-- Import from an installed package after setting TargetFramework.
+       Set AssGraphicsUseWinForms=true before this import for adapter controls.
+       All C# types become part of the consuming application's assembly. -->
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PlatformTarget>x64</PlatformTarget>
+    <UseWindowsForms Condition="'$(AssGraphicsUseWinForms)' == 'true'">true</UseWindowsForms>
+    <AssGraphicsNativeDll Condition="'$(AssGraphicsNativeDll)' == ''">$(MSBuildThisFileDirectory)..\bin\ass_graphics_lib.dll</AssGraphicsNativeDll>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)Ass.Graphics\*.cs" Link="AssGraphics\Core\%(Filename)%(Extension)" />
+    <Compile Include="$(MSBuildThisFileDirectory)Ass.Graphics.WinForms\*.cs"
+             Condition="'$(AssGraphicsUseWinForms)' == 'true'" Link="AssGraphics\WinForms\%(Filename)%(Extension)" />
+    <Content Include="$(AssGraphicsNativeDll)" Link="ass_graphics_lib.dll"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="ValidateAssGraphicsDeployment" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(AssGraphicsNativeDll)')" Text="Build/install ASS Graphics first or set AssGraphicsNativeDll to its native x64 DLL." />
+  </Target>
+</Project>

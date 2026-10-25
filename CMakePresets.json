@@ -1,0 +1,31 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "vs2026-x64",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "$env{ASS_GRAPHICS_WORK}/native",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "$env{ASS_GRAPHICS_WORK}/package-stage"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "$env{ASS_GRAPHICS_WORK}",
+        "rhs": ""
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "vs2026-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "vs2026-x64",
+      "configuration": "Release"
+    }
+  ]
+}

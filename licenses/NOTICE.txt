@@ -1,0 +1,9 @@
+ASS Graphics is an in-house consolidation of source mechanisms from the user's local projects.
+No new open-source license is imposed on that proprietary source.
+
+Embedded B612 Regular and Bold:
+Copyright 2012 The B612 Project Authors (https://github.com/polarsys/b612)
+Licensed under the SIL Open Font License, Version 1.1. See B612-OFL.txt.
+
+Windows SDK APIs and DirectX headers/libraries are build/platform dependencies.
+No vendor simulator SDK, Unity runtime, Vortice library or proprietary navigation data is redistributed here.
