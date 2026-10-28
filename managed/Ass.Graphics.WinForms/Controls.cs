@@ -4,19 +4,40 @@ namespace Ass.Graphics.WinForms;
 public sealed class ApplicationTheme : IDisposable
 {
     private readonly PrivateFontCollection fonts = new();
+    private readonly List<nint> fontMemory = new();
     private readonly GraphicsContext context;
     public System.Drawing.Font Regular { get; }
     public System.Drawing.Font Bold { get; }
     public ApplicationTheme(GraphicsContext context, float points = 10)
     {
         this.context = context;
-        foreach (bool bold in new[] { false, true })
+        try
         {
-            var data = context.FontData(bold);
-            fonts.AddMemoryFont(data.Data, (int)data.Length);
+            foreach (bool bold in new[] { false, true })
+            {
+                var data = context.FontData(bold);
+                int length = checked((int)data.Length);
+                nint memory = System.Runtime.InteropServices.Marshal.AllocHGlobal(length);
+                try { fontMemory.Add(memory); }
+                catch { System.Runtime.InteropServices.Marshal.FreeHGlobal(memory); throw; }
+                // GDI+ may retain the pointer. Own a copy of the already validated
+                // external bytes so disposing the native Context cannot invalidate it.
+                unsafe { Buffer.MemoryCopy(data.Data.ToPointer(), memory.ToPointer(), length, length); }
+                fonts.AddMemoryFont(memory, length);
+            }
+            Regular = new(fonts.Families[0], points, System.Drawing.FontStyle.Regular);
+            Bold = new(fonts.Families[0], points, System.Drawing.FontStyle.Bold);
         }
-        Regular = new(fonts.Families[0], points, System.Drawing.FontStyle.Regular);
-        Bold = new(fonts.Families[0], points, System.Drawing.FontStyle.Bold);
+        catch
+        {
+            Regular?.Dispose();
+            Bold?.Dispose();
+            fonts.Dispose();
+            foreach (nint memory in fontMemory)
+                System.Runtime.InteropServices.Marshal.FreeHGlobal(memory);
+            fontMemory.Clear();
+            throw;
+        }
     }
     public void Apply(Forms.Control control)
     {
@@ -29,6 +50,9 @@ public sealed class ApplicationTheme : IDisposable
         Regular.Dispose();
         Bold.Dispose();
         fonts.Dispose();
+        foreach (nint memory in fontMemory)
+            System.Runtime.InteropServices.Marshal.FreeHGlobal(memory);
+        fontMemory.Clear();
         GC.KeepAlive(context);
     }
 }

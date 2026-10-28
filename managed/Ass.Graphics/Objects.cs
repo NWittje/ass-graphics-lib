@@ -83,7 +83,7 @@ public abstract class GraphicsObject : IDisposable
         GC.SuppressFinalize(this);
     }
 }
-/// <summary>UI-thread context owning native factories and private B612 resources.</summary>
+/// <summary>UI-thread context owning native factories and the selected external B612 file bytes.</summary>
 public sealed unsafe class GraphicsContext : GraphicsObject
 {
     public GraphicsContext()

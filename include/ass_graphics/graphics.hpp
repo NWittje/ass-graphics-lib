@@ -84,7 +84,7 @@ class Object
         return r;
     }
 };
-/// Owns the UI-thread factories, private B612 fonts and immutable theme. Destroy last.
+/// Owns UI-thread factories and external B612 bytes resolved at the EXE/parent. Destroy last.
 class Context : public Object
 {
   public:

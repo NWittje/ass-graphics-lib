@@ -34,7 +34,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
         commands[0].kind = AG_TEXT;
         commands[0].rect = {12, 10, 320, 42};
         commands[0].color = {.1f, .12f, .15f, 1};
-        wcscpy_s(commands[0].text, L"Direct2D + embedded B612");
+        wcscpy_s(commands[0].text, L"Direct2D + external B612");
         commands[1].kind = AG_SEGMENTS;
         commands[1].rect = {16, 55, 300, 125};
         commands[1].color = {.1f, .55f, .4f, 1};

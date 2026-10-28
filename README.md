@@ -1,8 +1,22 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.4.4 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, private B612 Regular/Bold fonts, compiled shaders and static C/C++ runtime. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.4.5 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
-This repository contains implementation source, public headers, shader/resource inputs, required font assets/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
+This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
+
+## Required external B612 files
+
+Obtain B612-Regular.ttf and B612-Bold.ttf from https://github.com/polarsys/b612. Use the proportional upright Regular (weight 400) and Bold (weight 700) variants; do not use Mono or italic files.
+
+Each filename is resolved independently:
+1. Beside the consuming application's EXE.
+2. If absent there, exactly one directory above that EXE.
+
+An adjacent file overrides the shared parent copy. If a selected adjacent file is unreadable, corrupt, the wrong family/style/weight, or a broken explicit path, Context creation fails with a diagnostic; it never substitutes the parent or an installed font. Missing either required variant also fails. Lookup never uses the working directory, PATH, this DLL's location, a grandparent directory or global font installation.
+
+For example, Shared/B612-Regular.ttf and Shared/B612-Bold.ttf serve Shared/MyApp/MyApp.exe. Optional MyApp/B612-Regular.ttf overrides only Regular for that application. Application startup reads and validates both selected files once per Context, retains their bytes for that Context, and registers them privately for DirectWrite/native controls. The WinForms theme uses owned copies of those validated bytes. Restart/recreate the Context after replacing dependencies. No runtime checksum, expected digest or font revision is pinned; compatible upstream font updates are independent of the DLL.
+
+The shared preparation folder uses the exact empty marker place_norm_and_b612_here.txt as a placement reminder. The marker is not a font or an automatic downloader. ASS Graphics does not load NORM and does not distribute either dependency. Its operating guide should link the appropriate upstream projects. B612 needs no machine-wide font installation.
 
 ## Components
 
@@ -36,14 +50,14 @@ cmake --install "$env:ASS_GRAPHICS_WORK/native" --config Debug --prefix "$env:AS
 cmake --install "$env:ASS_GRAPHICS_WORK/native" --config Release --prefix "$env:ASS_GRAPHICS_WORK/install/Release"
 ~~~
 
-No Python, donor checkout or downloaded runtime asset is needed for this source-only build. Font hashes are checked during configuration. HLSL compiles during the build; full matching PDBs are installed for both configurations. The default build includes native basic, tray and gallery source examples. Set ASS_GRAPHICS_BUILD_EXAMPLES=OFF when only the DLL is needed.
+No Python, donor checkout or font binary is needed to compile this source-only build. Supply B612 externally before creating a graphics Context. HLSL compiles during the build; full matching PDBs are installed for both configurations. The default build includes native basic, tray and gallery source examples. Set ASS_GRAPHICS_BUILD_EXAMPLES=OFF when only the DLL is needed.
 
 The installed prefix contains bin/ass_graphics_lib.dll, lib/ass_graphics_lib.lib, public headers, CMake exports, symbols, source bindings and licenses. Use separate Debug/Release prefixes and keep their matching files together.
 
 ## Native integration
 
 ~~~cmake
-find_package(AssGraphics 1.4.4 CONFIG REQUIRED)
+find_package(AssGraphics 1.4.5 CONFIG REQUIRED)
 add_executable(MyTool WIN32 main.cpp)
 target_compile_features(MyTool PRIVATE cxx_std_20)
 target_link_libraries(MyTool PRIVATE ass::graphics)
@@ -87,6 +101,6 @@ Opaque C handles have explicit ownership. No STL objects, exceptions or allocato
 
 Scene is a small engineering renderer: no scene graph, model importer, material system, geodesy, physics or transparent-object sorting. Chart renders supplied data and validity; it is not a telemetry database. Settings does not migrate a donor application's schema. Existing projects are not migrated by this repository.
 
-B612 font files are required resource inputs, not compiled application binaries. They remain under the SIL Open Font License in licenses/B612-OFL.txt. licenses/NOTICE.txt covers attribution and the in-house source's proprietary status. No new open-source license is granted merely by publishing this repository.
+B612 binaries are not embedded or redistributed in this SDK or source tree. Obtain the upright proportional B612-Regular.ttf and B612-Bold.ttf from https://github.com/polarsys/b612 (not B612 Mono or italic variants). The retained upstream attribution and SIL Open Font License are in licenses/B612-OFL.txt. licenses/NOTICE.txt covers attribution and the in-house source's proprietary status. No new open-source license is granted merely by publishing this repository.
 
 This source publication does not establish Windows 10, physical mixed-monitor, simulator or hardware acceptance, and makes no new performance claim.

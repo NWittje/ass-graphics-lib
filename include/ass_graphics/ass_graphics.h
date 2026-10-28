@@ -235,6 +235,9 @@ extern "C"
        live and of the expected type. Do not free a handle from its own callback. */
     AG_API uint32_t ag_abi_version(void);
     AG_API ag_result ag_last_error(wchar_t *buffer, uint32_t capacity, uint32_t *required);
+    /* Requires B612-Regular.ttf and B612-Bold.ttf beside the consuming EXE or
+       its immediate parent (per-file adjacent priority). Invalid selected files
+       fail; CWD/PATH/global font installation are never dependency sources. */
     AG_API ag_result ag_context_create(ag_handle *out);
     AG_API ag_result ag_destroy(ag_handle object);
     /* Managed finalizer support: queue destruction on the context's UI thread.

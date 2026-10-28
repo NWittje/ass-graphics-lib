@@ -61,29 +61,7 @@ Context::Context() : Object(Kind::Context, nullptr)
               L"DirectWrite 5 requires Windows 10 1703 or newer");
         check(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)),
               L"WIC factory failed");
-        check(write->CreateInMemoryFontFileLoader(&loader), L"Font loader failed");
-        check(write->RegisterFontFileLoader(loader.Get()), L"Font loader registration failed");
-        ComPtr<IDWriteFontSetBuilder1> builder;
-        check(write->CreateFontSetBuilder(&builder), L"Font set builder failed");
-        for (int i = 0; i < 2; ++i)
-        {
-            auto res = FindResourceW(module(), MAKEINTRESOURCEW(101 + i), RT_RCDATA);
-            require(res != nullptr, L"Embedded B612 resource missing", E_FAIL);
-            font_bytes[i] = LockResource(LoadResource(module(), res));
-            font_sizes[i] = SizeofResource(module(), res);
-            DWORD count{};
-            gdi_fonts[i] =
-                AddFontMemResourceEx(const_cast<void *>(font_bytes[i]), font_sizes[i], nullptr, &count);
-            require(gdi_fonts[i] != nullptr, L"Private GDI font failed", E_FAIL);
-            ComPtr<IDWriteFontFile> file;
-            check(loader->CreateInMemoryFontFileReference(write.Get(), font_bytes[i], font_sizes[i], nullptr,
-                                                          &file),
-                  L"Embedded font reference failed");
-            check(builder->AddFontFile(file.Get()), L"Add embedded font failed");
-        }
-        ComPtr<IDWriteFontSet> set;
-        check(builder->CreateFontSet(&set), L"Font set failed");
-        check(write->CreateFontCollectionFromFontSet(set.Get(), &collection), L"Font collection failed");
+        load_fonts();
         WNDCLASSW wc{};
         wc.hInstance = module();
         wc.lpszClassName = L"AssGraphics.Release.1";
@@ -111,10 +89,10 @@ Context::Context() : Object(Kind::Context, nullptr)
         for (auto f : gdi_fonts)
             if (f)
                 RemoveFontMemResourceEx(f);
+        collection.Reset();
         if (write && loader)
             write->UnregisterFontFileLoader(loader.Get());
         wic.Reset();
-        collection.Reset();
         loader.Reset();
         write.Reset();
         d2d.Reset();

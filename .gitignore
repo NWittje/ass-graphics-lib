@@ -40,3 +40,6 @@
 *.log
 *.zip
 *.7z
+# External font binaries are local qualification inputs, never redistributed.
+*.ttf
+*.otf

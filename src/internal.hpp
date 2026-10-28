@@ -153,6 +153,8 @@ struct Context final : Object
     ComPtr<IDWriteFontCollection1> collection;
     ComPtr<IWICImagingFactory> wic;
     std::array<HANDLE, 2> gdi_fonts{};
+    // Own exact selected external bytes; ag_font_data borrows until Context destruction.
+    std::array<std::vector<uint8_t>, 2> font_storage;
     std::array<const void *, 2> font_bytes{};
     std::array<uint32_t, 2> font_sizes{};
     std::map<uint64_t, HFONT> fonts;
@@ -160,6 +162,7 @@ struct Context final : Object
     HWND reaper{};
     Context();
     ~Context();
+    void load_fonts();
     HFONT font(float points = 0, bool bold = false, UINT dpi = 96);
     ComPtr<IDWriteTextFormat> format(float size, bool bold = false);
 };
