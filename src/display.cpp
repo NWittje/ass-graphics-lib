@@ -7,6 +7,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <set>
+#include <optional>
 namespace ag
 {
 namespace
@@ -207,7 +208,128 @@ struct Display final : Surface
     Painter painter;
     ReplayRenderer replay{context};
     bool replay_active{};
-    bool source_dirty{true}, prepared{}, offscreen{}, targets_dirty{true};
+    bool source_dirty{true}, prepared{}, offscreen{}, targets_dirty{true}, render_active{};
+    uint32_t lookup_dirty{};
+    struct LookupStaging
+    {
+        std::vector<BYTE> pixels;
+        uint32_t width, height, format;
+        LookupStaging(uint32_t w, uint32_t h, uint32_t f) : width(w), height(h), format(f) {}
+    };
+    // Optional storage avoids constructing unused Debug vector proxies. It belongs
+    // to the Display epoch, so candidate Graph copies never duplicate staging.
+    std::array<std::optional<LookupStaging>, 16> lookup_staging;
+    struct LookupCpuPolicy { uint64_t base{}, allowance{}; };
+    uint64_t lookup_cpu_base{}, lookup_cpu_capacity{}, lookup_staging_allowance{};
+    static LookupCpuPolicy lookup_cpu_policy(const Graph &g)
+    {
+        LookupCpuPolicy result;
+        require(g.lookups.size() <= 16, L"Invalid lookup CPU policy");
+        for (const auto &l : g.lookups)
+        {
+            require(l.pixels.size() == l.desc.bytes &&
+                        uint64_t(l.pixels.capacity()) <= UINT64_MAX - result.base &&
+                        l.desc.bytes <= 256 * MiB - result.allowance, L"Invalid lookup CPU policy");
+            result.base += l.pixels.capacity();
+            result.allowance += l.desc.bytes;
+        }
+        require(result.base <= UINT64_MAX - result.allowance, L"Lookup CPU capacity overflow");
+        return result;
+    }
+    void lookup_epoch(LookupCpuPolicy policy) noexcept
+    {
+        for (auto &entry : lookup_staging)
+            entry.reset();
+        lookup_cpu_base = lookup_cpu_capacity = policy.base;
+        lookup_staging_allowance = policy.allowance;
+    }
+    bool lookup_source_overlaps(const void *pixels, uint32_t bytes, uint32_t i) const noexcept
+    {
+        auto overlaps = [](uintptr_t a, uint64_t an, uintptr_t b, uint64_t bn)
+        { return an && bn && (a < b ? uint64_t(b - a) < an : uint64_t(a - b) < bn); };
+        const auto address = reinterpret_cast<uintptr_t>(pixels);
+        if (overlaps(address, bytes, reinterpret_cast<uintptr_t>(this), sizeof(*this)))
+            return true;
+        const auto &entry = lookup_staging[i];
+        return entry && overlaps(address, bytes, reinterpret_cast<uintptr_t>(entry->pixels.data()),
+                                  entry->pixels.capacity());
+    }
+    struct LookupReserve
+    {
+        void operator()(std::vector<BYTE> &v, size_t bytes) const { v.reserve(bytes); }
+    };
+    struct LookupExtent { uint64_t row, packed; };
+    // Pure extent arithmetic is shared with owner boundary tests; it never probes
+    // memory or turns an arbitrary integer address into a readable object.
+    static LookupExtent lookup_extent(const ag_lookup_texture &d, uint32_t stride, uint32_t bytes,
+                                      uintptr_t address)
+    {
+        require(d.width && d.height && d.width <= 16384 && d.height <= 16384 &&
+                    d.format <= AG_RGBA16_FLOAT && d.mipmaps <= 1, L"Invalid installed lookup metadata");
+        const uint64_t row = uint64_t(d.width) * (d.format == AG_RGBA16_FLOAT ? 8 : 4);
+        const uint64_t required = uint64_t(stride) * (d.height - 1) + row;
+        require(address && stride >= row && required <= bytes && bytes <= 256 * MiB &&
+                    uint64_t(bytes) <= UINTPTR_MAX - address, L"Invalid lookup update pixel bounds");
+        return {row, row * d.height};
+    }
+    // The statically bound reserve policy also lets owner-side tests exercise
+    // failure/over-allocation without an exported production fault hook.
+    template<class Reserve = LookupReserve>
+    void lookup_pixels(uint32_t i, const void *pixels, uint32_t stride, uint32_t bytes, Reserve reserve = {})
+    {
+        require(!render_active, L"Lookup update during render", HRESULT_FROM_WIN32(ERROR_BUSY));
+        require(i < graph.lookups.size() && i < 16, L"Invalid lookup update index");
+        auto &l = graph.lookups[i];
+        const auto &d = l.desc;
+        const auto extent = lookup_extent(d, stride, bytes, reinterpret_cast<uintptr_t>(pixels));
+        const auto row = extent.row, packed = extent.packed;
+        require(packed <= d.bytes && l.pixels.size() == d.bytes, L"Invalid lookup CPU shadow");
+        require(revision != UINT64_MAX, L"Display revision exhausted", HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW));
+        auto &cache = lookup_staging[i];
+        require(!cache || (cache->width == d.width && cache->height == d.height && cache->format == d.format),
+                L"Lookup staging shape mismatch", E_FAIL);
+        require(!lookup_source_overlaps(pixels, bytes, i), L"Lookup source overlaps writable storage");
+        require(lookup_cpu_capacity >= lookup_cpu_base &&
+                    lookup_cpu_capacity - lookup_cpu_base <= lookup_staging_allowance,
+                L"Invalid lookup staging accounting", E_FAIL);
+        const uint64_t remaining = lookup_staging_allowance - (lookup_cpu_capacity - lookup_cpu_base);
+        const bool allocate = !cache || cache->pixels.capacity() < packed;
+        if (allocate)
+        {
+            require(!cache || !cache->pixels.capacity(), L"Lookup staging capacity mismatch", E_FAIL);
+            require(packed <= remaining, L"Lookup staging allowance exhausted", E_OUTOFMEMORY);
+        }
+        if (!cache)
+            cache.emplace(d.width, d.height, d.format);
+        auto &staging = cache->pixels;
+        if (allocate)
+        {
+            reserve(staging, static_cast<size_t>(packed));
+            const uint64_t allocated = staging.capacity();
+            if (allocated > remaining)
+            {
+                cache.reset();
+                throw Failure{E_OUTOFMEMORY, L"Lookup staging capacity exceeds allowance"};
+            }
+            lookup_cpu_capacity += allocated;
+        }
+        // Capacity is admitted before resize/copy; BYTE construction cannot throw.
+        // Accepted storage remains intact even when the caller aliases that image.
+        staging.resize(static_cast<size_t>(packed));
+        const auto input = static_cast<const BYTE *>(pixels);
+        if (stride == row)
+            std::memcpy(staging.data(), input, static_cast<size_t>(packed));
+        else
+            for (uint32_t y = 0; y < d.height; ++y)
+                std::memcpy(staging.data() + size_t(y) * row, input + size_t(y) * stride, size_t(row));
+        l.pixels.swap(staging);
+        l.desc.stride = static_cast<uint32_t>(row);
+        l.desc.bytes = static_cast<uint32_t>(packed);
+        lookup_dirty |= 1u << i;
+        ++revision;
+        if (hwnd)
+            InvalidateRect(hwnd, nullptr, FALSE);
+    }
     uint64_t revision{}, candidate_bytes{};
     uint32_t candidate_count{};
     uint32_t output_w{}, output_h{};
@@ -546,6 +668,7 @@ struct Display final : Surface
         }
         targets = std::move(next);
         targets_dirty = false;
+        lookup_dirty = 0; // Target preparation uploaded every retained CPU shadow.
         require(targets.bytes + candidate_bytes + replay.image_bytes() <= desc.texture_budget,
                 L"Replay texture budget exceeded", E_OUTOFMEMORY);
         stats.texture_bytes = targets.bytes + replay.image_bytes();
@@ -587,6 +710,13 @@ struct Display final : Surface
     void render(double seconds, bool force = false)
     {
         require(std::isfinite(seconds) && seconds >= 0, L"Invalid display elapsed time");
+        struct RenderScope
+        {
+            bool &active;
+            bool previous;
+            explicit RenderScope(bool &value) : active(value), previous(value) { active = true; }
+            ~RenderScope() { active = previous; }
+        } rendering(render_active);
         elapsed = seconds;
         stats.suspended = !output_w || !output_h ||
                           (!offscreen && (!IsWindowVisible(hwnd) || IsIconic(GetAncestor(hwnd, GA_ROOT))));
@@ -594,8 +724,11 @@ struct Display final : Surface
             return;
         auto start = std::chrono::steady_clock::now();
         auto allocations = cpp_allocations;
+        const bool rebuild = targets_dirty || !device;
         ensure();
-        if (replay_active && !force && !source_dirty && !graph.temporal && !stats.error)
+        // Rebuilt output/pass targets have no cached result, even when the fixed
+        // source was reused and preparation already uploaded every lookup.
+        if (replay_active && !force && !rebuild && !source_dirty && !lookup_dirty && !graph.temporal && !stats.error)
         {
             stats.cpu_ms = 0;
             stats.cpp_allocations = cpp_allocations - allocations;
@@ -610,6 +743,19 @@ struct Display final : Surface
             immediate->End(q.start.Get());
         }
         clear_bindings();
+        if (lookup_dirty)
+        {
+            require(targets.lookups.size() == graph.lookups.size(), L"Lookup target set incomplete", E_FAIL);
+            for (uint32_t i = 0; i < graph.lookups.size(); ++i)
+                if (lookup_dirty & (1u << i))
+                {
+                    const auto &l = graph.lookups[i];
+                    auto &t = targets.lookups[i];
+                    immediate->UpdateSubresource(t.texture.Get(), 0, nullptr, l.pixels.data(), l.desc.stride, 0);
+                    if (t.mipmaps)
+                        immediate->GenerateMips(t.raw.Get());
+                }
+        }
         if (source_dirty)
         {
             drawing->SetTarget(targets.bitmap.Get());
@@ -756,6 +902,7 @@ struct Display final : Surface
         stats.cpu_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         stats.error = 0;
+        lookup_dirty = 0;
     }
     void get_metrics(ag_metrics &out) override
     {
@@ -957,6 +1104,7 @@ ag_result ag_display_configure(ag_handle h, const ag_display_desc *d)
                 p->painter.reset();
                 p->targets = std::move(t);
                 p->targets_dirty = false;
+                p->lookup_dirty = 0;
                 p->source_dirty = true;
                 p->prepared = false;
                 ++p->revision;
@@ -1042,6 +1190,7 @@ ag_result ag_display_effects(ag_handle h, const ag_effect_graph *g)
         {
             auto p = display(h);
             auto next = graph_copy(g);
+            const auto cpu_policy = Display::lookup_cpu_policy(next);
             p->initialize();
             for (auto &pass : next.passes)
                 p->shader(pass);
@@ -1049,8 +1198,10 @@ ag_result ag_display_effects(ag_handle h, const ag_effect_graph *g)
             p->drawing->SetTarget(nullptr);
             p->painter.reset();
             p->graph = std::move(next);
+            p->lookup_epoch(cpu_policy);
             p->targets = std::move(t);
             p->targets_dirty = false;
+            p->lookup_dirty = 0;
             p->source_dirty = true;
             p->prepared = false;
             p->stats.temporal = p->graph.temporal;
@@ -1075,6 +1226,10 @@ ag_result ag_display_parameters(ag_handle h, uint32_t i, const void *data, uint3
                 p->immediate->UpdateSubresource(pass.constants.Get(), 0, nullptr, pass.padded.data(), 0, 0);
             }
         });
+}
+ag_result ag_display_lookup_pixels(ag_handle h, uint32_t index, const void *pixels, uint32_t stride, uint32_t bytes)
+{
+    return api([&] { display(h)->lookup_pixels(index, pixels, stride, bytes); });
 }
 ag_result ag_display_render(ag_handle h, double seconds)
 {
@@ -1229,14 +1384,17 @@ ag_result ag_display_commit(ag_handle h, ag_handle handle)
             auto p = display(h);
             auto c = candidate(handle);
             require(c->owner == p, L"Candidate belongs to another display");
+            const auto cpu_policy = Display::lookup_cpu_policy(c->graph);
             p->drawing->SetTarget(nullptr);
             p->painter.reset();
             p->candidate_bytes -= c->reserved;
             c->reserved = 0;
             p->desc = c->desc;
             p->graph = std::move(c->graph);
+            p->lookup_epoch(cpu_policy);
             p->targets = std::move(c->targets);
             p->targets_dirty = false;
+            p->lookup_dirty = 0;
             p->source_dirty = true;
             p->prepared = false;
             p->stats.temporal = p->graph.temporal;

@@ -103,6 +103,19 @@ extern "C"
                                        uint32_t path_count);
     AG_API ag_result ag_display_effects(ag_handle display, const ag_effect_graph *graph);
     AG_API ag_result ag_display_parameters(ag_handle display, uint32_t pass, const void *data, uint32_t bytes);
+    /* UI-thread latest CPU image for an installed lookup; name, shape, format and
+       mipmap policy stay fixed. Rows may be padded. pixels must denote stable,
+       readable bytes throughout this synchronous copy (no invalid-pointer probing).
+       S_OK accepts owned CPU pixels and invalidates prepared candidates; upload
+       occurs at the next eligible render and is not GPU/presentation completion.
+       Validation/allocation failure preserves accepted pixels, dirty bits and
+       revision; first-use scratch metadata may change. Reentry during render fails.
+       Source must not overlap Display metadata or its writable staging capacity.
+       Accepted CPU pixels survive resize/device reset. Staging is lazy and reused;
+       its extra retained pixel capacity is bounded by the installed graph payload,
+       separately from GPU/candidate/allocator storage. */
+    AG_API ag_result ag_display_lookup_pixels(ag_handle display, uint32_t lookup_index,
+                                               const void *pixels, uint32_t stride, uint32_t bytes);
     AG_API ag_result ag_display_render(ag_handle display, double elapsed_seconds);
     AG_API ag_result ag_display_export_png(ag_handle display, const wchar_t *path);
     AG_API ag_result ag_display_metrics_get(ag_handle display, ag_display_metrics *out);

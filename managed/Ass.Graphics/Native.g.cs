@@ -211,6 +211,8 @@ public static unsafe class Native {
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_display_parameters(GraphicsHandle display, uint pass, nint data, uint bytes);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_display_lookup_pixels(GraphicsHandle display, uint lookup_index, nint pixels, uint stride, uint bytes);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_display_render(GraphicsHandle display, double elapsed_seconds);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_display_export_png(GraphicsHandle display, char* path);

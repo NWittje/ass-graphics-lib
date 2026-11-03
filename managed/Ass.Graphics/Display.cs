@@ -54,6 +54,8 @@ public sealed unsafe class Display : GraphicsObject {
  public void Effects(EffectGraph* graph=null)=>GraphicsError.Check(Native.ag_display_effects(H,graph));
  public void Parameters(uint pass,ReadOnlySpan<byte> bytes){fixed(byte* data=bytes)GraphicsError.Check(Native.ag_display_parameters(H,pass,(nint)data,(uint)bytes.Length));}
  public void Render(double seconds)=>GraphicsError.Check(Native.ag_display_render(H,seconds));
+ /// <summary>Copies the latest fixed-shape lookup image on the UI thread; upload is deferred to rendering.</summary>
+ public void LookupPixels(uint index,ReadOnlySpan<byte> pixels,uint stride){fixed(byte* data=pixels)GraphicsError.Check(Native.ag_display_lookup_pixels(H,index,(nint)data,stride,(uint)pixels.Length));}
  public void ExportPng(string file){fixed(char* path=file)GraphicsError.Check(Native.ag_display_export_png(H,path));}
  public void Reset()=>GraphicsError.Check(Native.ag_device_reset(H));
  public DisplayMetrics Metrics {get{DisplayMetrics m=new(){Size=(uint)sizeof(DisplayMetrics),Version=1};GraphicsError.Check(Native.ag_display_metrics_get(H,&m));return m;}}

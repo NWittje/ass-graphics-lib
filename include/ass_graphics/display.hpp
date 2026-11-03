@@ -72,6 +72,12 @@ class Display : public Object
     {
         check(ag_display_render(handle(), seconds));
     }
+    void lookup_pixels(uint32_t index, std::span<const std::byte> pixels, uint32_t stride)
+    {
+        if (pixels.size() > UINT32_MAX)
+            throw std::length_error("Lookup image exceeds ABI byte extent");
+        check(ag_display_lookup_pixels(handle(), index, pixels.data(), stride, uint32_t(pixels.size())));
+    }
     void export_png(const wchar_t *path)
     {
         check(ag_display_export_png(handle(), path));
