@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(ass_graphics_lib VERSION 1.4.6 LANGUAGES C CXX RC)
+project(ass_graphics_lib VERSION 1.4.7 LANGUAGES C CXX RC)
 include(cmake/VersionInfo.cmake)
 set(CMAKE_SUPPRESS_REGENERATION ON)
 add_link_options(/INCREMENTAL:NO)

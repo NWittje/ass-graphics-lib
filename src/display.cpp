@@ -333,6 +333,7 @@ struct Display final : Surface
     uint64_t revision{}, candidate_bytes{};
     uint32_t candidate_count{};
     uint32_t output_w{}, output_h{};
+    uint32_t swap_w{}, swap_h{};
     ag_display_metrics stats{sizeof(ag_display_metrics), 1};
     double elapsed{}, previous{};
     uint64_t frame{};
@@ -618,10 +619,15 @@ struct Display final : Surface
         immediate->VSSetShaderResources(0, 16, none);
         immediate->OMSetRenderTargets(0, nullptr, nullptr);
     }
+    bool needs_swap() const noexcept
+    {
+        return !offscreen && (!swap || !back || swap_w != output_w || swap_h != output_h);
+    }
     void swap_resize(uint32_t w, uint32_t h)
     {
         if (offscreen)
             return;
+        require(w && h, L"Window presentation requires positive dimensions");
         clear_bindings();
         back.Reset();
         if (swap)
@@ -649,28 +655,38 @@ struct Display final : Surface
         ComPtr<ID3D11Texture2D> b;
         check(swap->GetBuffer(0, IID_PPV_ARGS(&b)), L"Display backbuffer failed");
         check(device->CreateRenderTargetView(b.Get(), nullptr, &back), L"Display back view failed");
+        swap_w = w;
+        swap_h = h;
     }
     void ensure()
     {
         initialize();
-        if (!targets_dirty)
-            return;
-        bool reuse = desc.raster_policy && targets.source.w == desc.source_width &&
-                     targets.source.h == desc.source_height && targets.source.texture;
-        auto next = prepare(graph, output_w, output_h, reuse);
-        swap_resize(output_w, output_h);
-        drawing->SetTarget(nullptr);
-        if (!reuse)
+        // Graph/configuration/candidate commits can already own clean effect
+        // targets before the first frame. Window presentation is an independent
+        // readiness condition, and stable chains must not be resized per frame.
+        if (targets_dirty)
         {
-            painter.reset();
-            source_dirty = true;
-            prepared = false;
+            bool reuse = desc.raster_policy && targets.source.w == desc.source_width &&
+                         targets.source.h == desc.source_height && targets.source.texture;
+            auto next = prepare(graph, output_w, output_h, reuse);
+            if (needs_swap())
+                swap_resize(output_w, output_h);
+            drawing->SetTarget(nullptr);
+            if (!reuse)
+            {
+                painter.reset();
+                source_dirty = true;
+                prepared = false;
+            }
+            targets = std::move(next);
+            targets_dirty = false;
+            lookup_dirty = 0; // Preparation uploaded every retained CPU shadow.
+            require(targets.bytes + candidate_bytes + replay.image_bytes() <= desc.texture_budget,
+                    L"Replay texture budget exceeded", E_OUTOFMEMORY);
         }
-        targets = std::move(next);
-        targets_dirty = false;
-        lookup_dirty = 0; // Target preparation uploaded every retained CPU shadow.
-        require(targets.bytes + candidate_bytes + replay.image_bytes() <= desc.texture_budget,
-                L"Replay texture budget exceeded", E_OUTOFMEMORY);
+        else if (needs_swap())
+            swap_resize(output_w, output_h);
+        // Report the active targets even when an earlier graph install prepared them.
         stats.texture_bytes = targets.bytes + replay.image_bytes();
         stats.source_width = targets.source.w;
         stats.source_height = targets.source.h;
@@ -724,7 +740,7 @@ struct Display final : Surface
             return;
         auto start = std::chrono::steady_clock::now();
         auto allocations = cpp_allocations;
-        const bool rebuild = targets_dirty || !device;
+        const bool rebuild = targets_dirty || !device || needs_swap();
         ensure();
         // Rebuilt output/pass targets have no cached result, even when the fixed
         // source was reused and preparation already uploaded every lookup.
@@ -959,7 +975,6 @@ struct Display final : Surface
         if (immediate)
         {
             immediate->ClearState();
-            immediate->Flush();
         }
         if (drawing)
             drawing->SetTarget(nullptr);
@@ -967,6 +982,11 @@ struct Display final : Surface
         targets = {};
         back.Reset();
         swap.Reset();
+        swap_w = swap_h = 0;
+        // DXGI permits one flip chain per HWND. Flush deferred destruction only
+        // after releasing its buffer views/references, before a later recreation.
+        if (immediate)
+            immediate->Flush();
         drawing.Reset();
         d2d.Reset();
         frame_buffer.Reset();
@@ -1330,7 +1350,7 @@ ag_result ag_display_prepare(ag_handle h, const ag_display_desc *d, const ag_eff
                 throw;
             }
             p->desc = old;
-            if (!p->offscreen && p->output_w && p->output_h)
+            if (p->output_w && p->output_h && p->needs_swap())
                 p->swap_resize(p->output_w, p->output_h);
             c->reserved = c->targets.bytes;
             p->candidate_bytes += c->reserved;

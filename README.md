@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.4.6 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.4.7 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 
@@ -33,6 +33,8 @@ The shared preparation folder uses the exact empty marker place_norm_and_b612_he
 | Simple orientation/platform preview | CPU wire projection plus Canvas lines |
 | Solid engineering 3D | Scene: Direct3D11 mesh/camera/depth, wireframe, lighting, blur and shared Direct2D overlays |
 
+Window-backed Displays support installing a graph before their first render. An eligible visible render ensures the HWND swap chain independently of effect-target preparation; no preliminary render or resize workaround is needed. Stable chains are reused. See docs/window-presentation.md in the SDK for first-use, suspension and reset qualification.
+
 For changing complete raster images, `ag_display_lookup_pixels` copies the latest fixed-shape lookup image into retained CPU storage and defers upload until rendering. Graph/shader/texture resources remain installed; viewport resize is independent. C++ and C# wrappers call the same endpoint. See docs/lookup-pixels.md in the SDK for ownership, bounds and acceptance-versus-upload limits.
 
 The application owns simulator protocols, data acquisition, units, coordinate conversion, physical limits, settings meaning and scene geometry. The DLL contains generic mechanisms. Native API comments in include/ass_graphics define coordinates, bounds and ownership.
@@ -59,7 +61,7 @@ The installed prefix contains bin/ass_graphics_lib.dll, lib/ass_graphics_lib.lib
 ## Native integration
 
 ~~~cmake
-find_package(AssGraphics 1.4.6 CONFIG REQUIRED)
+find_package(AssGraphics 1.4.7 CONFIG REQUIRED)
 add_executable(MyTool WIN32 main.cpp)
 target_compile_features(MyTool PRIVATE cxx_std_20)
 target_link_libraries(MyTool PRIVATE ass::graphics)
