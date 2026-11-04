@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.5.1 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.5.2 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 
@@ -41,6 +41,8 @@ For changing complete raster images, `ag_display_lookup_pixels` copies the lates
 `ag_display_submit_stencil` accepts a complete ordered retained recipe on a fixed source raster. Mask coverage/updates/tests and opaque path paint run on D3D11; unmasked replay keeps Direct2D drawing. One selected mask per test, explicit byte values and unsupported combinations are documented in include/ass_graphics/stencil.h and the SDK's docs/stencil.md. The C++ and C# wrappers share the same native renderer. No CPU colour raster precedes this path.
 
 Stencil paint also supports an owned opaque4x4 ARGB8 tile for filled and positive-width stroked paths. `AG_REPLAY_TILE` resources and `AG_STENCIL_PAINT_TILE` select context paint; ordinary colour restores solid paint. Tiles stay anchored to source-raster pixels while geometry moves. A64-byte shader constant buffer supplies colours directly; no full-size tile image or CPU colour raster is generated. See the SDK's docs/tile-paint.md for the descriptor, bounds and qualification scope.
+
+Stencil resource/descriptor preparation has a separate16MiB ceiling inside its existing64MiB counted owner budget. Ordinary replay and the shared resource cache keep their3MiB limits; path/mesh/texture limits and the public ABI are unchanged. See the SDK's docs/preparation.md for disconnected-path stress results and the distinction between preparation and rendering.
 
 The application owns simulator protocols, data acquisition, units, coordinate conversion, physical limits, settings meaning and scene geometry. The DLL contains generic mechanisms. Native API comments in include/ass_graphics define coordinates, bounds and ownership.
 

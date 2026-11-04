@@ -249,15 +249,23 @@ struct ReplayRenderer
         }
         return r;
     }
-    bool submit(const ag_replay_snapshot &d, uint64_t texture_available, bool allow_tiles = false)
+    enum class Domain
     {
+        Ordinary,
+        Stencil
+    };
+    bool submit(const ag_replay_snapshot &d, uint64_t texture_available, Domain domain = Domain::Ordinary)
+    {
+        // Stencil has a second, aggregate64MiB owner check after preparation.
+        // Keep ordinary replay's contract and the shared resource cache at3MiB.
+        const uint64_t scene_limit = (domain == Domain::Stencil ? 16ull : 3ull) * 1024 * 1024;
         require(d.size == sizeof d && d.version == 1 && d.command_count <= 65536 &&
                     d.resource_count <= 65536 && (!d.command_count || d.commands) &&
                     (!d.resource_count || d.resources),
                 L"Invalid replay snapshot");
         require(uint64_t(d.command_count) * sizeof(ag_replay_command) +
                         uint64_t(d.resource_count + 1) * sizeof(std::shared_ptr<ReplayResource>) <=
-                    3 * 1024 * 1024,
+                    scene_limit,
                 L"Replay CPU descriptor budget exceeded", E_OUTOFMEMORY);
         ReplayScene next;
         next.resources.resize(d.resource_count + 1);
@@ -267,10 +275,11 @@ struct ReplayRenderer
         {
             auto &r = d.resources[i];
             require(r.id == i + 1, L"Replay resource order");
-            require(allow_tiles || r.kind != AG_REPLAY_TILE, L"Tile resources require stencil replay");
+            require(domain == Domain::Stencil || r.kind != AG_REPLAY_TILE,
+                    L"Tile resources require stencil replay");
             next.resources[r.id] = resource(r);
             bytes += next.resources[r.id]->bytes();
-            require(bytes <= 3 * 1024 * 1024, L"Replay snapshot CPU budget exceeded", E_OUTOFMEMORY);
+            require(bytes <= scene_limit, L"Replay snapshot CPU preparation budget exceeded", E_OUTOFMEMORY);
         }
         std::array<bool, 17> contexts{}, strokes{};
         contexts[0] = true;
@@ -315,7 +324,7 @@ struct ReplayRenderer
                 require(c.value <= 1, L"Unsupported replay sampling/hint");
             next.commands.push_back(c);
         }
-        require(bytes <= 3 * 1024 * 1024, L"Replay snapshot CPU budget exceeded", E_OUTOFMEMORY);
+        require(bytes <= scene_limit, L"Replay snapshot CPU preparation budget exceeded", E_OUTOFMEMORY);
         uint64_t imagebytes = 0;
         for (auto &r : next.resources)
             if (r && r->kind == 3)

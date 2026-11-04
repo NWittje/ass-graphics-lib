@@ -443,7 +443,7 @@ struct StencilRenderer
         }
         ag_replay_snapshot replay{sizeof(replay),  1,          uint32_t(ordinary.size()), s.resource_count,
                                   ordinary.data(), s.resources};
-        resources.submit(replay, available, true);
+        resources.submit(replay, available, ReplayRenderer::Domain::Stencil);
         Scene n;
         n.w = w;
         n.h = h;
