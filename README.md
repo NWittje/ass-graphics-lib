@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.6.0 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.6.1 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 
@@ -118,3 +118,7 @@ B612 binaries are not embedded or redistributed in this SDK or source tree. Obta
 This source publication does not establish Windows 10, physical mixed-monitor, simulator or hardware acceptance, and makes no new performance claim.
 
 Ordered integer materials use the additive ordered.h / ordered.hpp API and Ordered.cs source bindings. This explicit FL11.1/ROV lane has no automatic software fallback; desc.warp selects WARP diagnostics deliberately. CPU acceptance, actual submission and GPU completion are distinct; the last completed image remains on candidate rejection. See docs/ordered-materials.md in the SDK for trusted shader bindings, logical-part coverage, ownership, limits and measured qualification.
+
+Version 1.6.1 creates complete source targets when an ordered effect graph is installed before the first render, including initially hidden child windows. Existing populated sources stay shared across graph changes, resize and zero-sized output suspension. A device reset recreates the source from the retained recipe. See docs/ordered-initialization.md in the SDK.
+
+Version 1.6.1 also adds sample-correlated display timing through timing.h / timing.hpp and the C# Timing extension. The legacy GPU metric now includes ordered rendering. Source GPU, graph/output GPU, CPU submission, CPU Present and independent CPU admission scopes remain distinct; sequence/flags distinguish new material submissions from cached viewport redraws. Collection stays nonblocking. See docs/display-timing.md in the SDK.

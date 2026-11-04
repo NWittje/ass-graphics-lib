@@ -165,6 +165,8 @@ struct OrderedRenderer
     ag_ordered_caps caps{sizeof(ag_ordered_caps), 1};
     ag_ordered_state stats{sizeof(ag_ordered_state), 1};
     uint64_t requested{}, pending_sequence{}, issued{};
+    uint64_t admission_sequence{};
+    double admission_ms{};
     ComPtr<ID3D11Device> owner;
     ComPtr<ID3D11VertexShader> vertex;
     ComPtr<ID3D11InputLayout> layout;
@@ -272,6 +274,7 @@ struct OrderedRenderer
     void submit(const ag_ordered_snapshot &s, std::shared_ptr<OrderedProgramData> p, uint32_t w, uint32_t h,
                 float lw, float lh, uint64_t available)
     {
+        auto admission_start = std::chrono::steady_clock::now();
         require(s.size == sizeof(s) && s.version == 1 && s.sequence > requested && s.command_count <= 16383 &&
                     s.resource_count <= 4096 && (!s.command_count || s.commands) &&
                     (!s.resource_count || s.resources) && s.record_count && s.record_count <= 65536 &&
@@ -390,6 +393,10 @@ struct OrderedRenderer
         stats.cpu_bytes = cpu_bytes();
         stats.vertex_bytes = latest->vertices.size() * sizeof(Vertex);
         stats.record_bytes = latest->records.size() * 16;
+        admission_sequence = s.sequence;
+        admission_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - admission_start)
+                .count();
     }
     void reset()
     {
@@ -524,30 +531,37 @@ struct OrderedRenderer
             ++stats.resource_creations;
         }
     }
+    bool ready_for_work(ID3D11Device *d, ID3D11DeviceContext *gpu)
+    {
+        if (!pending)
+            return latest && issued != requested;
+        BOOL complete = FALSE;
+        auto hr = gpu->GetData(query.Get(), &complete, sizeof(complete), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (FAILED(hr))
+        {
+            stats.failure = hr;
+            stats.device_lost = FAILED(d->GetDeviceRemovedReason());
+            check(hr, L"Ordered completion failed");
+        }
+        if (hr == S_OK && complete)
+        {
+            check(d->GetDeviceRemovedReason(), L"Ordered device completion failed");
+            return true;
+        }
+        return false;
+    }
     bool progress(ID3D11Device *d, ID3D11DeviceContext *gpu, ID2D1DeviceContext *drawing,
-                  ID3D11Texture2D *destination, ID3D11VertexShader *fullscreen)
+                  ID3D11Texture2D *destination, ID3D11VertexShader *fullscreen, bool ready)
     {
         bool changed = false;
-        if (pending)
+        if (pending && ready)
         {
-            BOOL complete = FALSE;
-            auto hr = gpu->GetData(query.Get(), &complete, sizeof(complete), D3D11_ASYNC_GETDATA_DONOTFLUSH);
-            if (FAILED(hr))
-            {
-                stats.failure = hr;
-                stats.device_lost = FAILED(d->GetDeviceRemovedReason());
-                check(hr, L"Ordered completion failed");
-            }
-            if (hr == S_OK && complete)
-            {
-                check(d->GetDeviceRemovedReason(), L"Ordered device completion failed");
-                gpu->CopyResource(destination, lane.colour.Get());
-                stats.completed = pending_sequence;
-                stats.available = 1;
-                stats.pending = 0;
-                pending.reset();
-                changed = true;
-            }
+            gpu->CopyResource(destination, lane.colour.Get());
+            stats.completed = pending_sequence;
+            stats.available = 1;
+            stats.pending = 0;
+            pending.reset();
+            changed = true;
         }
         if (pending || !latest || issued == requested)
             return changed;
@@ -648,7 +662,8 @@ struct OrderedRenderer
         ++stats.resolves;
         gpu->ClearState();
         gpu->End(query.Get());
-        gpu->Flush();
+        // Display closes its enclosing timing interval and submits once, or
+        // presents. Keeping the flush there includes this work in GPU timing.
         pending = s;
         pending_sequence = requested;
         issued = requested;

@@ -2,6 +2,7 @@
 #include "replay_impl.hpp"
 #include "stencil_impl.hpp"
 #include "ordered_impl.hpp"
+#include "ass_graphics/timing.h"
 #include "display_ps.h"
 #include "display_vs.h"
 #include <chrono>
@@ -373,11 +374,95 @@ struct Display final : Surface
     std::array<ComPtr<ID3D11SamplerState>, 8> samplers;
     struct Query
     {
-        ComPtr<ID3D11Query> disjoint, start, end;
-        bool pending{};
+        ComPtr<ID3D11Query> disjoint, start, source_end, end;
+        ag_display_timing record{sizeof(ag_display_timing), 1};
+        bool pending{}, recording{};
     };
     std::array<Query, 4> queries;
     uint32_t query_index{};
+    uint64_t timing_id{}, timing_dropped{};
+    ag_display_timing last_timing{sizeof(ag_display_timing), 1};
+    struct TimingScope
+    {
+        Display &display;
+        Query *query{};
+        std::chrono::steady_clock::time_point start;
+        uint32_t flags{};
+        uint64_t ordered_sequence{}, composited_sequence{};
+        double present_ms{};
+        bool source_closed{}, gpu_closed{}, finished{}, present_submitted{};
+        TimingScope(Display &d, std::chrono::steady_clock::time_point began) : display(d), start(began)
+        {
+            require(d.timing_id != UINT64_MAX, L"Display timing sequence exhausted", E_FAIL);
+            auto id = ++d.timing_id;
+            for (uint32_t i = 0; i < d.queries.size(); ++i)
+            {
+                auto index = (d.query_index + i) % uint32_t(d.queries.size());
+                auto &candidate = d.queries[index];
+                if (!candidate.pending && !candidate.recording)
+                {
+                    query = &candidate;
+                    d.query_index = (index + 1) % uint32_t(d.queries.size());
+                    break;
+                }
+            }
+            if (!query)
+            {
+                ++d.timing_dropped;
+                return;
+            }
+            query->record = {sizeof(ag_display_timing), 1};
+            query->record.sample_id = id;
+            query->record.device_generation = d.stats.device_recreations;
+            query->recording = true;
+            d.immediate->Begin(query->disjoint.Get());
+            d.immediate->End(query->start.Get());
+        }
+        void source_end() noexcept
+        {
+            if (query && !source_closed)
+                display.immediate->End(query->source_end.Get());
+            source_closed = true;
+        }
+        void end_gpu() noexcept
+        {
+            source_end();
+            if (query && !gpu_closed)
+            {
+                display.immediate->End(query->end.Get());
+                display.immediate->End(query->disjoint.Get());
+            }
+            gpu_closed = true;
+        }
+        void finish(bool success = true) noexcept
+        {
+            if (finished)
+                return;
+            end_gpu();
+            // One offscreen/material-only flush submits both rendering and its
+            // timing/event queries. Present submits ordinary window composition.
+            if (!present_submitted && (query || (flags & AG_TIMING_ORDERED_SUBMITTED)))
+                display.immediate->Flush();
+            display.stats.cpu_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (query)
+            {
+                auto &r = query->record;
+                r.flags = flags | (success ? 0u : AG_TIMING_FAILED);
+                r.ordered_sequence = ordered_sequence;
+                r.composited_sequence = composited_sequence;
+                r.cpu_present_ms = present_ms;
+                r.cpu_render_ms = std::max(0., display.stats.cpu_ms - present_ms);
+                query->recording = false;
+                query->pending = true;
+            }
+            finished = true;
+        }
+        ~TimingScope()
+        {
+            finish(false);
+        }
+    };
     Display(Context *c, ag_display_desc d)
         : Surface(Kind::Display, c), desc(d), painter(c), output_w(d.output_width), output_h(d.output_height)
     {
@@ -475,6 +560,7 @@ struct Display final : Surface
                 check(device->CreateQuery(&d, &q.disjoint), L"GPU timestamp query failed");
                 d.Query = D3D11_QUERY_TIMESTAMP;
                 check(device->CreateQuery(&d, &q.start), L"GPU start query failed");
+                check(device->CreateQuery(&d, &q.source_end), L"GPU source query failed");
                 check(device->CreateQuery(&d, &q.end), L"GPU end query failed");
             }
             for (auto &p : graph.passes)
@@ -566,11 +652,43 @@ struct Display final : Surface
             return t.history[i.index];
         return (i.mipmaps || i.srgb) ? t.source_mipped : t.source;
     }
+    bool reusable_source(uint32_t w, uint32_t h) const
+    {
+        return w && h && targets.source.w == w && targets.source.h == h && targets.source_mipped.w == w &&
+               targets.source_mipped.h == h && targets.source.texture && targets.source.target &&
+               targets.source.raw && targets.source_mipped.texture && targets.source_mipped.target &&
+               targets.source_mipped.raw && targets.source_mipped.encoded && targets.bitmap;
+    }
+    static uint64_t source_bytes(uint32_t w, uint32_t h)
+    {
+        uint64_t bytes = uint64_t(w) * h * 4;
+        for (uint32_t x = w, y = h;; x = std::max(1u, x / 2), y = std::max(1u, y / 2))
+        {
+            bytes += uint64_t(x) * y * 4;
+            if (x == 1 && y == 1)
+                return bytes;
+        }
+    }
+    void share_source(Targets &t) const
+    {
+        t.source = targets.source;
+        t.source_mipped = targets.source_mipped;
+        t.bitmap = targets.bitmap;
+    }
     Targets prepare(const Graph &g, uint32_t w, uint32_t h, bool reuse = false)
     {
         Targets t;
         if (!w || !h)
+        {
+            // A graph may change while output is suspended. Completed fixed
+            // source colour remains useful even though output/pass targets do not.
+            if (reuse && reusable_source(desc.source_width, desc.source_height))
+            {
+                share_source(t);
+                t.bytes = source_bytes(desc.source_width, desc.source_height);
+            }
             return t;
+        }
         double scale = std::min(double(w) / desc.logical_width, double(h) / desc.logical_height);
         t.vw = std::max(1u, UINT(std::lround(desc.logical_width * scale)));
         t.vh = std::max(1u, UINT(std::lround(desc.logical_height * scale)));
@@ -578,14 +696,15 @@ struct Display final : Surface
         t.top = (h - t.vh) / 2;
         uint32_t sw = desc.raster_policy ? desc.source_width : t.vw,
                  sh = desc.raster_policy ? desc.source_height : t.vh;
+        // Reuse is a request, not proof of initialization. Effects can be
+        // installed before any render has allocated the source and its views.
+        reuse = reuse && reusable_source(sw, sh);
         // Account for two swap buffers even though DXGI owns their allocations.
         t.bytes = offscreen ? 0 : uint64_t(w) * h * 8;
         require(t.bytes <= desc.texture_budget, L"Swap buffers exceed texture budget", E_OUTOFMEMORY);
         if (reuse)
         {
-            t.source = targets.source;
-            t.source_mipped = targets.source_mipped;
-            t.bitmap = targets.bitmap;
+            share_source(t);
         }
         else
         {
@@ -625,14 +744,7 @@ struct Display final : Surface
         }
         if (reuse)
         {
-            uint64_t shared = uint64_t(sw) * sh * 4;
-            for (uint32_t x = sw, y = sh;; x = std::max(1u, x / 2), y = std::max(1u, y / 2))
-            {
-                shared += uint64_t(x) * y * 4;
-                if (x == 1 && y == 1)
-                    break;
-            }
-            t.bytes += shared;
+            t.bytes += source_bytes(sw, sh);
             return t;
         }
         ComPtr<IDXGISurface> surface;
@@ -698,8 +810,7 @@ struct Display final : Surface
         // readiness condition, and stable chains must not be resized per frame.
         if (targets_dirty)
         {
-            bool reuse = desc.raster_policy && targets.source.w == desc.source_width &&
-                         targets.source.h == desc.source_height && targets.source.texture;
+            bool reuse = desc.raster_policy && reusable_source(desc.source_width, desc.source_height);
             auto next = prepare(graph, output_w, output_h, reuse);
             if (needs_swap())
                 swap_resize(output_w, output_h);
@@ -728,22 +839,45 @@ struct Display final : Surface
         stats.viewport_width = targets.vw;
         stats.viewport_height = targets.vh;
     }
+    static ag_display_timing interpret_timing(const Query &q, const D3D11_QUERY_DATA_TIMESTAMP_DISJOINT &d,
+                                              uint64_t begin, uint64_t source, uint64_t end)
+    {
+        auto result = q.record;
+        result.gpu_disjoint = !!d.Disjoint;
+        result.gpu_known = !d.Disjoint && d.Frequency && begin <= source && source <= end &&
+                           !(result.flags & AG_TIMING_FAILED);
+        if (result.gpu_known)
+        {
+            result.gpu_total_ms = double(end - begin) * 1000 / d.Frequency;
+            result.gpu_source_ms = double(source - begin) * 1000 / d.Frequency;
+            result.gpu_graph_ms =
+                (result.flags & AG_TIMING_COMPOSITED) ? double(end - source) * 1000 / d.Frequency : 0;
+        }
+        return result;
+    }
     void query_collect()
     {
         for (auto &q : queries)
             if (q.pending)
             {
                 D3D11_QUERY_DATA_TIMESTAMP_DISJOINT d{};
-                UINT64 a{}, b{};
-                if (immediate->GetData(q.disjoint.Get(), &d, sizeof(d), D3D11_ASYNC_GETDATA_DONOTFLUSH) ==
-                        S_OK &&
-                    immediate->GetData(q.start.Get(), &a, sizeof(a), D3D11_ASYNC_GETDATA_DONOTFLUSH) ==
-                        S_OK &&
-                    immediate->GetData(q.end.Get(), &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+                UINT64 a{}, source{}, b{};
+                auto read = [&](ID3D11Query *query, void *data, UINT bytes)
+                {
+                    auto hr = immediate->GetData(query, data, bytes, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+                    check(hr, L"Display timing collection failed");
+                    return hr == S_OK;
+                };
+                if (read(q.disjoint.Get(), &d, sizeof(d)) && read(q.start.Get(), &a, sizeof(a)) &&
+                    read(q.source_end.Get(), &source, sizeof(source)) && read(q.end.Get(), &b, sizeof(b)))
                 {
                     q.pending = false;
-                    stats.gpu_known = !d.Disjoint && d.Frequency;
-                    stats.gpu_ms = stats.gpu_known ? double(b - a) * 1000 / d.Frequency : 0;
+                    if (q.record.sample_id >= last_timing.sample_id)
+                    {
+                        last_timing = interpret_timing(q, d, a, source, b);
+                        stats.gpu_known = last_timing.gpu_known;
+                        stats.gpu_ms = last_timing.gpu_total_ms;
+                    }
                 }
             }
     }
@@ -761,6 +895,11 @@ struct Display final : Surface
     void render(double seconds, bool force = false)
     {
         require(std::isfinite(seconds) && seconds >= 0, L"Invalid display elapsed time");
+        const bool suspended = !output_w || !output_h ||
+                               (!offscreen && (!IsWindowVisible(hwnd) || IsIconic(GetAncestor(hwnd, GA_ROOT))));
+        // Suspended calls remain harmless no-ops under an existing guard. Only
+        // nested GPU work must be rejected, since disjoint queries cannot nest.
+        require(!render_active || suspended, L"Display render cannot be reentered", E_UNEXPECTED);
         struct RenderScope
         {
             bool &active;
@@ -775,8 +914,7 @@ struct Display final : Surface
             }
         } rendering(render_active);
         elapsed = seconds;
-        stats.suspended = !output_w || !output_h ||
-                          (!offscreen && (!IsWindowVisible(hwnd) || IsIconic(GetAncestor(hwnd, GA_ROOT))));
+        stats.suspended = suspended;
         if (stats.suspended)
         {
             if (ordered_opt_in && hwnd)
@@ -786,6 +924,17 @@ struct Display final : Surface
         auto start = std::chrono::steady_clock::now();
         auto allocations = cpp_allocations;
         const bool rebuild = targets_dirty || !device || needs_swap();
+        initialize();
+        query_collect();
+        const bool ordered_ready = ordered_opt_in && ordered.ready_for_work(device.Get(), immediate.Get());
+        if (replay_active && !force && !rebuild && !source_dirty && !lookup_dirty && !graph.temporal &&
+            !stats.error && !ordered_ready)
+        {
+            stats.cpu_ms = 0;
+            stats.cpp_allocations = cpp_allocations - allocations;
+            return;
+        }
+        TimingScope timing(*this, start);
         ensure();
         bool ordered_changed = false;
         if (ordered_opt_in)
@@ -795,8 +944,16 @@ struct Display final : Surface
                 const float black[4]{0, 0, 0, 1};
                 immediate->ClearRenderTargetView(targets.source.target.Get(), black);
             }
+            auto submissions = ordered.stats.submissions;
             ordered_changed = ordered.progress(device.Get(), immediate.Get(), drawing.Get(),
-                                               targets.source.texture.Get(), vertex.Get());
+                                               targets.source.texture.Get(), vertex.Get(), ordered_ready);
+            if (ordered.stats.submissions != submissions)
+            {
+                timing.flags |= AG_TIMING_ORDERED_SUBMITTED;
+                timing.ordered_sequence = ordered.stats.submitted;
+            }
+            if (ordered_changed)
+                timing.flags |= AG_TIMING_SOURCE_UPDATED;
             source_dirty = source_dirty || ordered_changed;
             if (hwnd)
             {
@@ -811,17 +968,9 @@ struct Display final : Surface
         if (replay_active && !force && !rebuild && !source_dirty && !lookup_dirty && !graph.temporal &&
             !stats.error)
         {
-            stats.cpu_ms = 0;
+            timing.finish();
             stats.cpp_allocations = cpp_allocations - allocations;
             return;
-        }
-        query_collect();
-        auto &q = queries[query_index++ % queries.size()];
-        bool measuring = !q.pending;
-        if (measuring)
-        {
-            immediate->Begin(q.disjoint.Get());
-            immediate->End(q.start.Get());
         }
         clear_bindings();
         if (lookup_dirty)
@@ -840,6 +989,8 @@ struct Display final : Surface
         }
         if (source_dirty)
         {
+            if (!ordered_opt_in)
+                timing.flags |= AG_TIMING_SOURCE_UPDATED;
             if (ordered_opt_in)
             {
                 // progress() alone commits a GPU-completed colour candidate.
@@ -879,6 +1030,7 @@ struct Display final : Surface
             source_dirty = false;
             ++stats.source_draws;
         }
+        timing.source_end();
         Frame constants{};
         dimensions(constants.source, targets.source.w, targets.source.h);
         dimensions(constants.viewport, targets.vw, targets.vh);
@@ -898,7 +1050,8 @@ struct Display final : Surface
                 auto &t = input(in, targets);
                 dimensions(constants.inputs[in.slot], t.w, t.h);
                 auto srv = in.srgb ? t.encoded.Get() : t.raw.Get();
-                require(srv, L"sRGB input format unavailable");
+                require(srv, in.srgb ? L"sRGB input format unavailable"
+                                     : L"Effect input sampling view unavailable");
                 auto sampler = samplers[in.linear + 2 * in.repeat + 4 * in.mipmaps].Get();
                 immediate->PSSetShaderResources(in.slot, 1, &srv);
                 immediate->VSSetShaderResources(in.slot, 1, &srv);
@@ -972,26 +1125,33 @@ struct Display final : Surface
                                              targets.source.texture.Get(), 0, nullptr);
             immediate->GenerateMips(targets.history[0].raw.Get());
         }
-        if (measuring)
-        {
-            immediate->End(q.end.Get());
-            immediate->End(q.disjoint.Get());
-            q.pending = true;
-        }
         if (swap)
         {
             ComPtr<ID3D11Texture2D> b;
             check(swap->GetBuffer(0, IID_PPV_ARGS(&b)), L"Display present buffer failed");
             immediate->CopyResource(b.Get(), targets.output.texture.Get());
-            check(swap->Present(0, 0), L"Display presentation failed");
+        }
+        timing.flags |= AG_TIMING_COMPOSITED;
+        if (ordered_opt_in && ordered.stats.available)
+            timing.composited_sequence = ordered.stats.completed;
+        timing.end_gpu();
+        if (swap)
+        {
+            auto before_present = std::chrono::steady_clock::now();
+            auto result = swap->Present(0, 0);
+            timing.present_submitted = result == S_OK;
+            timing.present_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before_present)
+                    .count();
+            timing.flags |= AG_TIMING_PRESENT_CALLED;
+            check(result, L"Display presentation failed");
         }
         ++frame;
         ++stats.frames;
         previous = seconds;
         stats.temporal = graph.temporal;
+        timing.finish();
         stats.cpp_allocations = cpp_allocations - allocations;
-        stats.cpu_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         stats.error = 0;
         lookup_dirty = 0;
     }
@@ -1101,6 +1261,8 @@ struct Display final : Surface
         prepared = false;
         stats.texture_bytes = 0;
         stats.gpu_known = 0;
+        stats.gpu_ms = 0;
+        last_timing = {sizeof(ag_display_timing), 1};
     }
     void export_png(const wchar_t *path)
     {
@@ -1575,6 +1737,26 @@ ag_result ag_display_metrics_get(ag_handle h, ag_display_metrics *out)
             out->source_height = p->targets.source.h;
             out->viewport_width = p->targets.vw;
             out->viewport_height = p->targets.vh;
+        });
+}
+ag_result ag_display_timing_get(ag_handle h, ag_display_timing *out)
+{
+    return api(
+        [&]
+        {
+            descriptor(out);
+            auto p = display(h);
+            if (p->immediate)
+                p->query_collect();
+            *out = p->last_timing;
+            out->gpu_pending = uint32_t(
+                std::count_if(p->queries.begin(), p->queries.end(), [](auto &q) { return q.pending; }));
+            out->dropped_samples = p->timing_dropped;
+            if (p->ordered_opt_in)
+            {
+                out->admission_sequence = p->ordered.admission_sequence;
+                out->cpu_admission_ms = p->ordered.admission_ms;
+            }
         });
 }
 ag_result ag_display_capabilities(ag_handle h, ag_display_caps *out)
