@@ -61,7 +61,7 @@ struct ReplayRenderer
     }
     std::shared_ptr<ReplayResource> resource(const ag_replay_resource &d)
     {
-        require(d.size == sizeof d && d.version == 1 && d.kind >= 1 && d.kind <= 3,
+        require(d.size == sizeof d && d.version == 1 && d.kind >= 1 && d.kind <= 4,
                 L"Invalid replay resource descriptor");
         auto r = std::make_shared<ReplayResource>();
         r->kind = d.kind;
@@ -118,6 +118,11 @@ struct ReplayRenderer
         }
         else
         {
+            if (d.kind == AG_REPLAY_TILE)
+                require(d.image_width == 4 && d.image_height == 4 && d.stride == 16 && d.pixel_bytes == 64 &&
+                            d.pixels && !d.winding && !d.segment_count && !d.segments && d.width == 0 &&
+                            d.miter == 0 && d.phase == 0 && !d.cap && !d.join && !d.dash_count && !d.dashes,
+                        L"Tiles require exactly 4x4 opaque ARGB8 colours and zero unused members");
             require(d.image_width && d.image_height && d.image_width <= 16384 && d.image_height <= 16384 &&
                         d.stride == uint64_t(d.image_width) * 4 &&
                         d.pixel_bytes == uint64_t(d.stride) * d.image_height &&
@@ -129,6 +134,9 @@ struct ReplayRenderer
             append(r->key, r->h);
             auto p = static_cast<const uint8_t *>(d.pixels);
             r->pixels.assign(p, p + d.pixel_bytes);
+            if (d.kind == AG_REPLAY_TILE)
+                for (size_t i = 3; i < r->pixels.size(); i += 4)
+                    require(r->pixels[i] == 255, L"Tile colours must be explicitly opaque ARGB8");
             r->key.insert(r->key.end(), p, p + d.pixel_bytes);
         }
         auto keyhash = hash(r->key);
@@ -241,7 +249,7 @@ struct ReplayRenderer
         }
         return r;
     }
-    bool submit(const ag_replay_snapshot &d, uint64_t texture_available)
+    bool submit(const ag_replay_snapshot &d, uint64_t texture_available, bool allow_tiles = false)
     {
         require(d.size == sizeof d && d.version == 1 && d.command_count <= 65536 &&
                     d.resource_count <= 65536 && (!d.command_count || d.commands) &&
@@ -259,6 +267,7 @@ struct ReplayRenderer
         {
             auto &r = d.resources[i];
             require(r.id == i + 1, L"Replay resource order");
+            require(allow_tiles || r.kind != AG_REPLAY_TILE, L"Tile resources require stencil replay");
             next.resources[r.id] = resource(r);
             bytes += next.resources[r.id]->bytes();
             require(bytes <= 3 * 1024 * 1024, L"Replay snapshot CPU budget exceeded", E_OUTOFMEMORY);

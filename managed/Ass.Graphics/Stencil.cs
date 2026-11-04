@@ -8,7 +8,8 @@ public enum StencilKind : uint
     WriteFill,
     WriteStroke,
     Test,
-    DisableTest
+    DisableTest,
+    PaintTile
 }
 public enum StencilComparison : uint
 {

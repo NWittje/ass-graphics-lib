@@ -14,7 +14,13 @@ extern "C"
         AG_STENCIL_WRITE_FILL,
         AG_STENCIL_WRITE_STROKE,
         AG_STENCIL_TEST,
-        AG_STENCIL_DISABLE_TEST
+        AG_STENCIL_DISABLE_TEST,
+        /* context + reference (AG_REPLAY_TILE resource ID, or zero for solid).
+           Children inherit paint. REPLAY_COLOUR replaces tile with solid paint.
+           Aliased opaque fill/positive-width stroke only; source-raster origin
+           (0,0), row-major texel = (floor(y)&3)*4+(floor(x)&3). Transforms/clips
+           change coverage, not phase. CLEAR remains solid opaque black. */
+        AG_STENCIL_PAINT_TILE
     };
     enum ag_stencil_comparison
     {
@@ -57,7 +63,8 @@ extern "C"
 
        REPLAY has only its nested command populated. Other records have a zero
        nested command; all unused named fields are zero (padding is irrelevant).
-       Masked paint supports opaque solid FILL/DRAW/CLEAR with AA disabled.
+       Masked paint supports opaque solid or tile FILL/DRAW with AA disabled;
+       CLEAR always paints opaque black. Tile paint also works without a test.
        Masked images, fractional opacity/alpha and hairline strokes are rejected.
        Mask writes accept filled or positive-width stroked paths, using current
        transform and frozen clip. No CPU colour rasterization or readback occurs.

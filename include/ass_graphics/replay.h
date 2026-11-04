@@ -10,7 +10,11 @@ extern "C"
     {
         AG_REPLAY_PATH = 1,
         AG_REPLAY_STROKE = 2,
-        AG_REPLAY_IMAGE = 3
+        AG_REPLAY_IMAGE = 3,
+        /* Stencil paint only: exactly 4x4 owned opaque ARGB8 colours. Use image
+           dimensions/stride/pixel_bytes/pixels; all other payload members zero.
+           Row-major uint32_t colours are 0xFFRRGGBB (BGRA bytes on Windows). */
+        AG_REPLAY_TILE = 4
     };
     enum ag_replay_kind
     {

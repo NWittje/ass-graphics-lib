@@ -35,6 +35,7 @@ struct StencilRenderer
         D2D1_MATRIX_3X2_F matrix = D2D1::Matrix3x2F::Identity();
         std::shared_ptr<Clip> clip;
         std::shared_ptr<ReplayResource> stroke;
+        std::shared_ptr<ReplayResource> tile;
         uint32_t argb{0xffffffff}, aa{1}, sampling{1};
         float opacity{1};
         bool test{};
@@ -74,6 +75,8 @@ struct StencilRenderer
     ComPtr<ID3D11PixelShader> pixel;
     ComPtr<ID3D11InputLayout> layout;
     ComPtr<ID3D11Buffer> constants;
+    ComPtr<ID3D11Buffer> tile_constants;
+    ComPtr<ID3D11DepthStencilState> unmasked;
     ComPtr<ID3D11BlendState> paint_blend, write_blend;
     ComPtr<ID3D11RasterizerState> raster;
     uint32_t gpu_w{}, gpu_h{}, gpu_masks{};
@@ -405,15 +408,16 @@ struct StencilRenderer
         {
             auto &c = s.commands[i];
             require(c.size == sizeof(c) && c.version == 1 && c.kind >= AG_STENCIL_REPLAY &&
-                        c.kind <= AG_STENCIL_DISABLE_TEST && !c.reserved,
+                        c.kind <= AG_STENCIL_PAINT_TILE && !c.reserved,
                     L"Invalid stencil command");
             bool write = c.kind == AG_STENCIL_WRITE_FILL || c.kind == AG_STENCIL_WRITE_STROKE;
             bool test = c.kind == AG_STENCIL_TEST, clear = c.kind == AG_STENCIL_CLEAR;
+            bool tile = c.kind == AG_STENCIL_PAINT_TILE;
             require((write || test || clear ? c.mask_index < s.mask_count : c.mask_index == 0) &&
                         (write ? c.path != 0 : c.path == 0) &&
                         (write ? c.clear_bits <= 255 && c.set_bits <= 255 : !c.clear_bits && !c.set_bits) &&
                         (test ? c.test_bits <= 255 : !c.test_bits) &&
-                        (test || clear ? c.reference <= 255 : !c.reference) &&
+                        (test || clear ? c.reference <= 255 : tile || !c.reference) &&
                         (test ? c.comparison == AG_STENCIL_EQUAL || c.comparison == AG_STENCIL_NOT_EQUAL
                               : !c.comparison) &&
                         (c.kind == AG_STENCIL_REPLAY || clear ? c.context == 0 : c.context < 17),
@@ -439,7 +443,7 @@ struct StencilRenderer
         }
         ag_replay_snapshot replay{sizeof(replay),  1,          uint32_t(ordinary.size()), s.resource_count,
                                   ordinary.data(), s.resources};
-        resources.submit(replay, available);
+        resources.submit(replay, available, true);
         Scene n;
         n.w = w;
         n.h = h;
@@ -492,6 +496,14 @@ struct StencilRenderer
             Operation o;
             o.kind = c.kind;
             o.mask = c.mask_index;
+            if (c.kind == AG_STENCIL_PAINT_TILE)
+            {
+                require(!c.reference || (c.reference < n.resources.size() &&
+                                         n.resources[c.reference]->kind == AG_REPLAY_TILE),
+                        L"Tile paint resource reference/type");
+                st.tile = c.reference ? n.resources[c.reference] : nullptr;
+                continue;
+            }
             if (c.kind == AG_STENCIL_TEST)
             {
                 st.test = true;
@@ -542,6 +554,7 @@ struct StencilRenderer
                     continue;
                 case AG_REPLAY_COLOUR:
                     rs.argb = r.argb;
+                    rs.tile.reset();
                     continue;
                 case AG_REPLAY_USE_STROKE:
                     rs.stroke = path;
@@ -567,12 +580,13 @@ struct StencilRenderer
                 o.comparison = r.kind;
                 if (r.kind == AG_REPLAY_BITMAP)
                     o.gpu = ReplayRenderer::matrix(r.matrix) * rs.matrix * n.root;
-                if (rs.test)
+                if (rs.test || (rs.tile && r.kind != AG_REPLAY_CLEAR))
                     require(r.kind != AG_REPLAY_BITMAP && rs.aa == 0 && rs.opacity == 1 &&
-                                (r.kind == AG_REPLAY_CLEAR || (rs.argb >> 24) == 255),
-                            L"Masked paint requires opaque aliased solid paths");
+                                (rs.tile || r.kind == AG_REPLAY_CLEAR || (rs.argb >> 24) == 255),
+                            L"Masked/tiled paint requires opaque aliased paths");
             }
-            if (o.kind != AG_STENCIL_REPLAY || o.state.test)
+            if (o.kind != AG_STENCIL_REPLAY || o.state.test ||
+                (o.state.tile && o.comparison != AG_REPLAY_CLEAR))
             {
                 o.mesh = mesh(o, n, s.mesh_vertex_limit - uint32_t(n.vertices));
                 if (used.insert(o.mesh.get()).second)
@@ -614,6 +628,8 @@ struct StencilRenderer
         pixel.Reset();
         layout.Reset();
         constants.Reset();
+        tile_constants.Reset();
+        unmasked.Reset();
         paint_blend.Reset();
         write_blend.Reset();
         raster.Reset();
@@ -652,12 +668,15 @@ struct StencilRenderer
         if (owner.Get() != device)
             reset();
         owner = device;
-        if (!vertex || !pixel || !layout || !constants || !paint_blend || !write_blend || !raster)
+        if (!vertex || !pixel || !layout || !constants || !tile_constants || !unmasked || !paint_blend ||
+            !write_blend || !raster)
         {
             vertex.Reset();
             pixel.Reset();
             layout.Reset();
             constants.Reset();
+            tile_constants.Reset();
+            unmasked.Reset();
             paint_blend.Reset();
             write_blend.Reset();
             raster.Reset();
@@ -673,6 +692,17 @@ struct StencilRenderer
             buffer.ByteWidth = 48;
             buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
             check(device->CreateBuffer(&buffer, nullptr, &constants), L"Stencil constant buffer failed");
+            buffer.ByteWidth = 64;
+            uint32_t initial_tile[16];
+            std::fill(std::begin(initial_tile), std::end(initial_tile), 0xff000000);
+            D3D11_SUBRESOURCE_DATA tile_data{initial_tile, 0, 0};
+            check(device->CreateBuffer(&buffer, &tile_data, &tile_constants), L"Tile constant buffer failed");
+            D3D11_DEPTH_STENCIL_DESC disabled{};
+            disabled.DepthFunc = D3D11_COMPARISON_ALWAYS;
+            disabled.FrontFace = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP,
+                                  D3D11_COMPARISON_ALWAYS};
+            disabled.BackFace = disabled.FrontFace;
+            check(device->CreateDepthStencilState(&disabled, &unmasked), L"Unmasked tile state failed");
             D3D11_BLEND_DESC blend{};
             auto &b = blend.RenderTarget[0];
             b.BlendEnable = TRUE;
@@ -689,7 +719,7 @@ struct StencilRenderer
             r.DepthClipEnable = TRUE;
             r.ScissorEnable = TRUE;
             check(device->CreateRasterizerState(&r, &raster), L"Stencil raster state failed");
-            metrics.resource_creations += 7;
+            metrics.resource_creations += 9;
         }
         if (gpu_w != scene.w || gpu_h != scene.h || gpu_masks != scene.masks || !bitmap)
         {
@@ -755,6 +785,8 @@ struct StencilRenderer
                     check(device->CreateBuffer(&b, &data, &m.buffer), L"Stencil mesh buffer failed");
                     ++metrics.resource_creations;
                 }
+                if (o.kind == AG_STENCIL_REPLAY && !o.state.test)
+                    continue;
                 auto index = state_index(o);
                 if (!states[index])
                 {
@@ -776,7 +808,7 @@ struct StencilRenderer
                 }
             }
         std::set<const Mesh *> unique;
-        metrics.buffer_bytes = 48;
+        metrics.buffer_bytes = 112;
         for (auto &m : cache)
             unique.insert(m.get());
         for (auto &o : scene.operations)
@@ -839,9 +871,12 @@ struct StencilRenderer
                     if (o.mesh->vertices.empty())
                         continue;
                     auto target = colour_view.Get();
-                    auto view = views[o.kind == AG_STENCIL_REPLAY ? s.mask : o.mask].Get();
+                    auto view = o.kind == AG_STENCIL_REPLAY ? (s.test ? views[s.mask].Get() : nullptr)
+                                                            : views[o.mask].Get();
                     gpu->OMSetRenderTargets(1, &target, view);
-                    gpu->OMSetDepthStencilState(states[state_index(o)].Get(),
+                    gpu->OMSetDepthStencilState(o.kind == AG_STENCIL_REPLAY && !s.test
+                                                    ? unmasked.Get()
+                                                    : states[state_index(o)].Get(),
                                                 o.kind == AG_STENCIL_REPLAY ? s.reference : o.reference);
                     gpu->OMSetBlendState(o.kind == AG_STENCIL_REPLAY ? paint_blend.Get() : write_blend.Get(),
                                          nullptr, 0xffffffff);
@@ -872,10 +907,19 @@ struct StencilRenderer
                     data[8] = float((argb >> 16) & 255) / 255;
                     data[9] = float((argb >> 8) & 255) / 255;
                     data[10] = float(argb & 255) / 255;
+                    if (o.kind == AG_STENCIL_REPLAY && s.tile && o.comparison != AG_REPLAY_CLEAR)
+                    {
+                        // This copies sixteen retained colours, not a CPU raster.
+                        // SV_Position chooses source phase independently of coverage.
+                        data[11] = 0;
+                        gpu->UpdateSubresource(tile_constants.Get(), 0, nullptr, s.tile->pixels.data(), 0, 0);
+                    }
                     gpu->UpdateSubresource(constants.Get(), 0, nullptr, data, 0, 0);
                     auto cb = constants.Get();
                     gpu->VSSetConstantBuffers(0, 1, &cb);
                     gpu->PSSetConstantBuffers(0, 1, &cb);
+                    cb = tile_constants.Get();
+                    gpu->PSSetConstantBuffers(1, 1, &cb);
                     gpu->Draw(UINT(o.mesh->vertices.size()), 0);
                     ++metrics.gpu_draws;
                 }
