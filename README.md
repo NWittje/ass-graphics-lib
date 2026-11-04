@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.6.1 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.6.2 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 

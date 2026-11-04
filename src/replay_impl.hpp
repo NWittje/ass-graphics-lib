@@ -59,10 +59,22 @@ struct ReplayRenderer
         }
         return h;
     }
-    std::shared_ptr<ReplayResource> resource(const ag_replay_resource &d)
+    std::shared_ptr<ReplayResource> resource(const ag_replay_resource &d,
+                                             const std::shared_ptr<ReplayResource> &previous)
     {
         require(d.size == sizeof d && d.version == 1 && d.kind >= 1 && d.kind <= 4,
                 L"Invalid replay resource descriptor");
+        // Byte-identical retained paths have already passed coordinate and
+        // contour validation. Compare owned storage, never caller addresses.
+        if (d.kind == AG_REPLAY_PATH && previous && previous->kind == AG_REPLAY_PATH &&
+            d.winding == previous->winding && d.segment_count == previous->segments.size() &&
+            (!d.segment_count || (d.segments &&
+                                  !memcmp(d.segments, previous->segments.data(),
+                                          size_t(d.segment_count) * sizeof(ag_replay_segment)))))
+        {
+            ++metrics.cache_hits;
+            return previous;
+        }
         auto r = std::make_shared<ReplayResource>();
         r->kind = d.kind;
         append(r->key, d.kind);
@@ -277,7 +289,8 @@ struct ReplayRenderer
             require(r.id == i + 1, L"Replay resource order");
             require(domain == Domain::Stencil || r.kind != AG_REPLAY_TILE,
                     L"Tile resources require stencil replay");
-            next.resources[r.id] = resource(r);
+            next.resources[r.id] = resource(r, r.id < scene.resources.size() ? scene.resources[r.id]
+                                                                           : nullptr);
             bytes += next.resources[r.id]->bytes();
             require(bytes <= scene_limit, L"Replay snapshot CPU preparation budget exceeded", E_OUTOFMEMORY);
         }

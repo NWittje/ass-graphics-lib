@@ -141,12 +141,13 @@ struct OrderedRenderer
         std::vector<Vertex> vertices;
         std::vector<Run> runs;
         std::vector<ag_ordered_record> records;
+        uint64_t coverage_bytes{};
         uint32_t initial[2]{};
         ComPtr<ID3D11Buffer> vertex_gpu, records_gpu;
         ComPtr<ID3D11ShaderResourceView> records_view;
         uint64_t bytes() const
         {
-            return sizeof(*this) + coverage->cpu_bytes() + vertices.capacity() * sizeof(Vertex) +
+            return sizeof(*this) + coverage_bytes + vertices.capacity() * sizeof(Vertex) +
                    runs.capacity() * sizeof(Run) + records.capacity() * sizeof(ag_ordered_record);
         }
         void reset()
@@ -162,6 +163,7 @@ struct OrderedRenderer
     std::vector<std::weak_ptr<OrderedProgramData>> programs;
     std::shared_ptr<Scene> latest, pending, bound;
     StencilRenderer lane;
+    uint64_t lane_cpu_bytes;
     ag_ordered_caps caps{sizeof(ag_ordered_caps), 1};
     ag_ordered_state stats{sizeof(ag_ordered_state), 1};
     uint64_t requested{}, pending_sequence{}, issued{};
@@ -175,7 +177,7 @@ struct OrderedRenderer
     std::array<ComPtr<ID3D11ShaderResourceView>, 2> srvs;
     ComPtr<ID3D11Query> query;
     uint32_t width{}, height{};
-    explicit OrderedRenderer(Context *c) : context(c), lane(c) {}
+    explicit OrderedRenderer(Context *c) : context(c), lane(c), lane_cpu_bytes(lane.cpu_bytes()) {}
     static ag_ordered_caps observe(ID3D11Device *d)
     {
         ag_ordered_caps out{sizeof(out), 1};
@@ -228,7 +230,7 @@ struct OrderedRenderer
                 bytes += v->bytes();
         // The GPU lane holds another shallow operation/resource list; geometry
         // lives in the scene above and is deliberately counted conservatively.
-        bytes += lane.cpu_bytes();
+        bytes += lane_cpu_bytes;
         return bytes;
     }
     std::shared_ptr<OrderedProgramData> program(const ag_ordered_program_desc &d)
@@ -337,6 +339,8 @@ struct OrderedRenderer
         }
         auto next = std::make_shared<Scene>();
         next->coverage = std::make_unique<StencilRenderer>(context);
+        if (latest)
+            next->coverage->inherit(*latest->coverage);
         next->program = std::move(p);
         ag_stencil_snapshot stencil{sizeof(stencil),
                                     1,
@@ -354,6 +358,7 @@ struct OrderedRenderer
         require(held < StencilRenderer::cpu_limit, L"Ordered CPU budget exceeded", E_OUTOFMEMORY);
         next->coverage->submit(stencil, w, h, lw, lh, available - uint64_t(w) * h * 8, true,
                                StencilRenderer::cpu_limit - held);
+        next->coverage_bytes = next->coverage->cpu_bytes();
         auto &ops = next->coverage->scene.operations;
         require(ops.size() == indices.size(), L"Ordered operation mapping failed", E_UNEXPECTED);
         uint64_t vertices = 0;
@@ -362,7 +367,7 @@ struct OrderedRenderer
                 vertices += o.mesh->vertices.size();
         require(vertices <= s.mesh_vertex_limit && vertices <= 1048576,
                 L"Ordered packed vertex limit exceeded", E_OUTOFMEMORY);
-        require(cpu_bytes(next.get()) + next->coverage->cpu_bytes() + vertices * sizeof(Vertex) +
+        require(cpu_bytes(next.get()) + next->coverage_bytes + vertices * sizeof(Vertex) +
                         uint64_t(s.record_count) * 16 + ops.size() * sizeof(Run) <=
                     StencilRenderer::cpu_limit,
                 L"Ordered CPU replacement budget exceeded", E_OUTOFMEMORY);
@@ -385,7 +390,7 @@ struct OrderedRenderer
         }
         next->initial[0] = s.initial[0];
         next->initial[1] = s.initial[1];
-        require(cpu_bytes(next.get()) + next->coverage->cpu_bytes() <= StencilRenderer::cpu_limit,
+        require(cpu_bytes(next.get()) + next->coverage_bytes <= StencilRenderer::cpu_limit,
                 L"Ordered retained CPU budget exceeded", E_OUTOFMEMORY);
         latest = std::move(next);
         requested = s.sequence;
@@ -411,6 +416,7 @@ struct OrderedRenderer
         pending.reset();
         bound.reset();
         lane.clear();
+        lane_cpu_bytes = lane.cpu_bytes();
         owner.Reset();
         vertex.Reset();
         layout.Reset();
@@ -442,6 +448,7 @@ struct OrderedRenderer
         if (scene_changed)
         {
             lane.scene = s->coverage->scene;
+            lane_cpu_bytes = lane.cpu_bytes();
             ++lane.revision;
             bound = s;
         }
