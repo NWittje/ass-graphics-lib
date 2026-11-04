@@ -1,5 +1,6 @@
 #include "internal.hpp"
 #include "replay_impl.hpp"
+#include "stencil_impl.hpp"
 #include "display_ps.h"
 #include "display_vs.h"
 #include <chrono>
@@ -207,6 +208,8 @@ struct Display final : Surface
     Snapshot commands;
     Painter painter;
     ReplayRenderer replay{context};
+    StencilRenderer stencil{context};
+    bool stencil_active{};
     bool replay_active{};
     bool source_dirty{true}, prepared{}, offscreen{}, targets_dirty{true}, render_active{};
     uint32_t lookup_dirty{};
@@ -219,7 +222,10 @@ struct Display final : Surface
     // Optional storage avoids constructing unused Debug vector proxies. It belongs
     // to the Display epoch, so candidate Graph copies never duplicate staging.
     std::array<std::optional<LookupStaging>, 16> lookup_staging;
-    struct LookupCpuPolicy { uint64_t base{}, allowance{}; };
+    struct LookupCpuPolicy
+    {
+        uint64_t base{}, allowance{};
+    };
     uint64_t lookup_cpu_base{}, lookup_cpu_capacity{}, lookup_staging_allowance{};
     static LookupCpuPolicy lookup_cpu_policy(const Graph &g)
     {
@@ -229,7 +235,8 @@ struct Display final : Surface
         {
             require(l.pixels.size() == l.desc.bytes &&
                         uint64_t(l.pixels.capacity()) <= UINT64_MAX - result.base &&
-                        l.desc.bytes <= 256 * MiB - result.allowance, L"Invalid lookup CPU policy");
+                        l.desc.bytes <= 256 * MiB - result.allowance,
+                    L"Invalid lookup CPU policy");
             result.base += l.pixels.capacity();
             result.allowance += l.desc.bytes;
         }
@@ -252,29 +259,37 @@ struct Display final : Surface
             return true;
         const auto &entry = lookup_staging[i];
         return entry && overlaps(address, bytes, reinterpret_cast<uintptr_t>(entry->pixels.data()),
-                                  entry->pixels.capacity());
+                                 entry->pixels.capacity());
     }
     struct LookupReserve
     {
-        void operator()(std::vector<BYTE> &v, size_t bytes) const { v.reserve(bytes); }
+        void operator()(std::vector<BYTE> &v, size_t bytes) const
+        {
+            v.reserve(bytes);
+        }
     };
-    struct LookupExtent { uint64_t row, packed; };
+    struct LookupExtent
+    {
+        uint64_t row, packed;
+    };
     // Pure extent arithmetic is shared with owner boundary tests; it never probes
     // memory or turns an arbitrary integer address into a readable object.
     static LookupExtent lookup_extent(const ag_lookup_texture &d, uint32_t stride, uint32_t bytes,
                                       uintptr_t address)
     {
-        require(d.width && d.height && d.width <= 16384 && d.height <= 16384 &&
-                    d.format <= AG_RGBA16_FLOAT && d.mipmaps <= 1, L"Invalid installed lookup metadata");
+        require(d.width && d.height && d.width <= 16384 && d.height <= 16384 && d.format <= AG_RGBA16_FLOAT &&
+                    d.mipmaps <= 1,
+                L"Invalid installed lookup metadata");
         const uint64_t row = uint64_t(d.width) * (d.format == AG_RGBA16_FLOAT ? 8 : 4);
         const uint64_t required = uint64_t(stride) * (d.height - 1) + row;
         require(address && stride >= row && required <= bytes && bytes <= 256 * MiB &&
-                    uint64_t(bytes) <= UINTPTR_MAX - address, L"Invalid lookup update pixel bounds");
+                    uint64_t(bytes) <= UINTPTR_MAX - address,
+                L"Invalid lookup update pixel bounds");
         return {row, row * d.height};
     }
     // The statically bound reserve policy also lets owner-side tests exercise
     // failure/over-allocation without an exported production fault hook.
-    template<class Reserve = LookupReserve>
+    template <class Reserve = LookupReserve>
     void lookup_pixels(uint32_t i, const void *pixels, uint32_t stride, uint32_t bytes, Reserve reserve = {})
     {
         require(!render_active, L"Lookup update during render", HRESULT_FROM_WIN32(ERROR_BUSY));
@@ -284,7 +299,8 @@ struct Display final : Surface
         const auto extent = lookup_extent(d, stride, bytes, reinterpret_cast<uintptr_t>(pixels));
         const auto row = extent.row, packed = extent.packed;
         require(packed <= d.bytes && l.pixels.size() == d.bytes, L"Invalid lookup CPU shadow");
-        require(revision != UINT64_MAX, L"Display revision exhausted", HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW));
+        require(revision != UINT64_MAX, L"Display revision exhausted",
+                HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW));
         auto &cache = lookup_staging[i];
         require(!cache || (cache->width == d.width && cache->height == d.height && cache->format == d.format),
                 L"Lookup staging shape mismatch", E_FAIL);
@@ -476,7 +492,7 @@ struct Display final : Surface
             if (!mip || (x == 1 && y == 1))
                 break;
         }
-        auto retained = targets.bytes + candidate_bytes + replay.image_bytes();
+        auto retained = targets.bytes + candidate_bytes + replay.image_bytes() + stencil.texture_bytes();
         require(retained <= desc.texture_budget && bytes <= desc.texture_budget - retained &&
                     allocation <= desc.texture_budget - retained - bytes,
                 L"Display texture budget exceeded", E_OUTOFMEMORY);
@@ -681,13 +697,14 @@ struct Display final : Surface
             targets = std::move(next);
             targets_dirty = false;
             lookup_dirty = 0; // Preparation uploaded every retained CPU shadow.
-            require(targets.bytes + candidate_bytes + replay.image_bytes() <= desc.texture_budget,
+            require(targets.bytes + candidate_bytes + replay.image_bytes() + stencil.texture_bytes() <=
+                        desc.texture_budget,
                     L"Replay texture budget exceeded", E_OUTOFMEMORY);
         }
         else if (needs_swap())
             swap_resize(output_w, output_h);
         // Report the active targets even when an earlier graph install prepared them.
-        stats.texture_bytes = targets.bytes + replay.image_bytes();
+        stats.texture_bytes = targets.bytes + replay.image_bytes() + stencil.texture_bytes();
         stats.source_width = targets.source.w;
         stats.source_height = targets.source.h;
         stats.viewport_width = targets.vw;
@@ -730,8 +747,14 @@ struct Display final : Surface
         {
             bool &active;
             bool previous;
-            explicit RenderScope(bool &value) : active(value), previous(value) { active = true; }
-            ~RenderScope() { active = previous; }
+            explicit RenderScope(bool &value) : active(value), previous(value)
+            {
+                active = true;
+            }
+            ~RenderScope()
+            {
+                active = previous;
+            }
         } rendering(render_active);
         elapsed = seconds;
         stats.suspended = !output_w || !output_h ||
@@ -744,7 +767,8 @@ struct Display final : Surface
         ensure();
         // Rebuilt output/pass targets have no cached result, even when the fixed
         // source was reused and preparation already uploaded every lookup.
-        if (replay_active && !force && !rebuild && !source_dirty && !lookup_dirty && !graph.temporal && !stats.error)
+        if (replay_active && !force && !rebuild && !source_dirty && !lookup_dirty && !graph.temporal &&
+            !stats.error)
         {
             stats.cpu_ms = 0;
             stats.cpp_allocations = cpp_allocations - allocations;
@@ -767,37 +791,43 @@ struct Display final : Surface
                 {
                     const auto &l = graph.lookups[i];
                     auto &t = targets.lookups[i];
-                    immediate->UpdateSubresource(t.texture.Get(), 0, nullptr, l.pixels.data(), l.desc.stride, 0);
+                    immediate->UpdateSubresource(t.texture.Get(), 0, nullptr, l.pixels.data(), l.desc.stride,
+                                                 0);
                     if (t.mipmaps)
                         immediate->GenerateMips(t.raw.Get());
                 }
         }
         if (source_dirty)
         {
-            drawing->SetTarget(targets.bitmap.Get());
-            drawing->SetDpi(96, 96);
-            if (!prepared)
-            {
-                if (!replay_active)
-                    painter.prepare(drawing.Get(), commands);
-                prepared = true;
-            }
-            drawing->BeginDraw();
-            drawing->Clear(D2D1::ColorF(0, 0, 0, 1));
-            float scale = std::min(float(targets.source.w) / desc.logical_width,
-                                   float(targets.source.h) / desc.logical_height);
-            // Painter commands carry logical transforms; multiply their transform by
-            // a root raster transform without modifying the retained CPU snapshot.
-            painter.root =
-                D2D1::Matrix3x2F::Scale(scale, scale) *
-                D2D1::Matrix3x2F::Translation((targets.source.w - desc.logical_width * scale) / 2,
-                                              (targets.source.h - desc.logical_height * scale) / 2);
-            if (replay_active)
-                replay.draw(drawing.Get(), painter.root);
+            if (stencil_active)
+                stencil.draw(device.Get(), immediate.Get(), drawing.Get(), targets.source.texture.Get());
             else
-                painter.draw(drawing.Get(), commands);
-            check(drawing->EndDraw(), L"Display source drawing failed");
-            drawing->SetTarget(nullptr);
+            {
+                drawing->SetTarget(targets.bitmap.Get());
+                drawing->SetDpi(96, 96);
+                if (!prepared)
+                {
+                    if (!replay_active)
+                        painter.prepare(drawing.Get(), commands);
+                    prepared = true;
+                }
+                drawing->BeginDraw();
+                drawing->Clear(D2D1::ColorF(0, 0, 0, 1));
+                float scale = std::min(float(targets.source.w) / desc.logical_width,
+                                       float(targets.source.h) / desc.logical_height);
+                // Painter commands carry logical transforms; multiply their transform by
+                // a root raster transform without modifying the retained CPU snapshot.
+                painter.root =
+                    D2D1::Matrix3x2F::Scale(scale, scale) *
+                    D2D1::Matrix3x2F::Translation((targets.source.w - desc.logical_width * scale) / 2,
+                                                  (targets.source.h - desc.logical_height * scale) / 2);
+                if (replay_active)
+                    replay.draw(drawing.Get(), painter.root);
+                else
+                    painter.draw(drawing.Get(), commands);
+                check(drawing->EndDraw(), L"Display source drawing failed");
+                drawing->SetTarget(nullptr);
+            }
             immediate->CopySubresourceRegion(targets.source_mipped.texture.Get(), 0, 0, 0, 0,
                                              targets.source.texture.Get(), 0, nullptr);
             immediate->GenerateMips(targets.source_mipped.raw.Get());
@@ -968,6 +998,7 @@ struct Display final : Surface
     }
     void reset() override
     {
+        stencil.reset();
         replay.reset();
         ++revision;
         if (hwnd)
@@ -1113,6 +1144,12 @@ ag_result ag_display_configure(ag_handle h, const ag_display_desc *d)
         {
             auto p = display(h);
             auto next = config(d);
+            require(!p->stencil_active ||
+                        (next.raster_policy == AG_RASTER_FIXED && next.source_width == p->desc.source_width &&
+                         next.source_height == p->desc.source_height &&
+                         next.logical_width == p->desc.logical_width &&
+                         next.logical_height == p->desc.logical_height),
+                    L"Submit another source before changing stencil coordinates");
             require(next.warp == p->desc.warp, L"Device selection requires a new surface");
             p->initialize();
             auto old = p->desc;
@@ -1160,6 +1197,12 @@ ag_result ag_display_submit(ag_handle h, const ag_draw *cmd, uint32_t n, const a
         {
             auto p = display(h);
             auto next = copy_snapshot(p->context, cmd, n, points, pn, paths, path_count);
+            if (p->stencil_active)
+            {
+                p->stencil.clear();
+                p->stencil_active = false;
+                ++p->revision;
+            }
             p->replay_active = false;
             p->commands = std::move(next);
             p->source_dirty = true;
@@ -1176,13 +1219,22 @@ ag_result ag_display_submit_replay(ag_handle h, const ag_replay_snapshot *s)
         {
             auto p = display(h);
             descriptor(s);
-            require(p->targets.bytes + p->candidate_bytes <= p->desc.texture_budget,
+            require(p->targets.bytes + p->candidate_bytes + p->stencil.texture_bytes() <=
+                        p->desc.texture_budget,
                     L"Replay texture budget exceeded", E_OUTOFMEMORY);
-            bool changed =
-                p->replay.submit(*s, p->desc.texture_budget - p->targets.bytes - p->candidate_bytes);
-            require(p->targets.bytes + p->candidate_bytes + p->replay.image_bytes() <= p->desc.texture_budget,
+            bool changed = p->replay.submit(*s, p->desc.texture_budget - p->targets.bytes -
+                                                    p->candidate_bytes - p->stencil.texture_bytes());
+            require(p->targets.bytes + p->candidate_bytes + p->replay.image_bytes() +
+                            p->stencil.texture_bytes() <=
+                        p->desc.texture_budget,
                     L"Replay texture budget exceeded", E_OUTOFMEMORY);
-            changed = changed || !p->replay_active;
+            changed = changed || !p->replay_active || p->stencil_active;
+            if (p->stencil_active)
+            {
+                p->stencil.clear();
+                p->stencil_active = false;
+                ++p->revision;
+            }
             p->replay_active = true;
             if (changed)
             {
@@ -1192,6 +1244,45 @@ ag_result ag_display_submit_replay(ag_handle h, const ag_replay_snapshot *s)
             ++p->metrics.submissions;
             if (p->hwnd && changed)
                 InvalidateRect(p->hwnd, nullptr, FALSE);
+        });
+}
+ag_result ag_display_submit_stencil(ag_handle h, const ag_stencil_snapshot *s)
+{
+    return api(
+        [&]
+        {
+            auto p = display(h);
+            descriptor(s);
+            require(p->desc.raster_policy == AG_RASTER_FIXED,
+                    L"Stencil scenes require a fixed source raster");
+            require(!p->render_active, L"Cannot replace stencil scene during rendering", E_UNEXPECTED);
+            require(p->revision != UINT64_MAX, L"Display revision exhausted", E_FAIL);
+            auto retained = p->targets.bytes + p->candidate_bytes + p->replay.image_bytes();
+            require(retained <= p->desc.texture_budget, L"Display texture budget exceeded", E_OUTOFMEMORY);
+            bool changed =
+                p->stencil.submit(*s, p->desc.source_width, p->desc.source_height, p->desc.logical_width,
+                                  p->desc.logical_height, p->desc.texture_budget - retained);
+            changed = changed || !p->stencil_active;
+            p->stencil_active = true;
+            p->replay_active = true;
+            if (changed)
+            {
+                p->source_dirty = true;
+                p->prepared = false;
+                ++p->revision;
+            }
+            ++p->metrics.submissions;
+            if (p->hwnd && changed)
+                InvalidateRect(p->hwnd, nullptr, FALSE);
+        });
+}
+ag_result ag_display_stencil_metrics(ag_handle h, ag_stencil_metrics *out)
+{
+    return api(
+        [&]
+        {
+            descriptor(out);
+            *out = display(h)->stencil.metrics;
         });
 }
 ag_result ag_display_replay_metrics(ag_handle h, ag_replay_metrics *out)
@@ -1247,7 +1338,8 @@ ag_result ag_display_parameters(ag_handle h, uint32_t i, const void *data, uint3
             }
         });
 }
-ag_result ag_display_lookup_pixels(ag_handle h, uint32_t index, const void *pixels, uint32_t stride, uint32_t bytes)
+ag_result ag_display_lookup_pixels(ag_handle h, uint32_t index, const void *pixels, uint32_t stride,
+                                   uint32_t bytes)
 {
     return api([&] { display(h)->lookup_pixels(index, pixels, stride, bytes); });
 }
@@ -1290,7 +1382,7 @@ ag_result ag_display_metrics_get(ag_handle h, ag_display_metrics *out)
             if (p->immediate)
                 p->query_collect();
             *out = p->stats;
-            out->texture_bytes = p->targets.bytes + p->replay.image_bytes();
+            out->texture_bytes = p->targets.bytes + p->replay.image_bytes() + p->stencil.texture_bytes();
             out->source_width = p->targets.source.w;
             out->source_height = p->targets.source.h;
             out->viewport_width = p->targets.vw;
@@ -1333,6 +1425,12 @@ ag_result ag_display_prepare(ag_handle h, const ag_display_desc *d, const ag_eff
             auto c = std::make_unique<Candidate>(p);
             if (d)
                 c->desc = config(d);
+            require(!p->stencil_active || (c->desc.raster_policy == AG_RASTER_FIXED &&
+                                           c->desc.source_width == p->desc.source_width &&
+                                           c->desc.source_height == p->desc.source_height &&
+                                           c->desc.logical_width == p->desc.logical_width &&
+                                           c->desc.logical_height == p->desc.logical_height),
+                    L"Candidate cannot change retained stencil coordinates");
             require(c->desc.warp == p->desc.warp, L"Candidate cannot replace device selection");
             c->graph = graph_copy(g);
             p->initialize();

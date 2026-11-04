@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.4.7 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.5.0 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 
@@ -32,10 +32,13 @@ The shared preparation folder uses the exact empty marker place_norm_and_b612_he
 | Telemetry history | Chart: panels/series, legends/units, linear and symmetric-log scales, patterns and missing-data gaps |
 | Simple orientation/platform preview | CPU wire projection plus Canvas lines |
 | Solid engineering 3D | Scene: Direct3D11 mesh/camera/depth, wireframe, lighting, blur and shared Direct2D overlays |
+| Ordered mask-dependent vector paint | Display stencil scenes: two independent byte masks, retained GPU path meshes, opaque paint and complete reset replay |
 
 Window-backed Displays support installing a graph before their first render. An eligible visible render ensures the HWND swap chain independently of effect-target preparation; no preliminary render or resize workaround is needed. Stable chains are reused. See docs/window-presentation.md in the SDK for first-use, suspension and reset qualification.
 
 For changing complete raster images, `ag_display_lookup_pixels` copies the latest fixed-shape lookup image into retained CPU storage and defers upload until rendering. Graph/shader/texture resources remain installed; viewport resize is independent. C++ and C# wrappers call the same endpoint. See docs/lookup-pixels.md in the SDK for ownership, bounds and acceptance-versus-upload limits.
+
+`ag_display_submit_stencil` accepts a complete ordered retained recipe on a fixed source raster. Mask coverage/updates/tests and opaque path paint run on D3D11; unmasked replay keeps Direct2D drawing. One selected mask per test, explicit byte values and unsupported combinations are documented in include/ass_graphics/stencil.h and the SDK's docs/stencil.md. The C++ and C# wrappers share the same native renderer. No CPU colour raster precedes this path.
 
 The application owns simulator protocols, data acquisition, units, coordinate conversion, physical limits, settings meaning and scene geometry. The DLL contains generic mechanisms. Native API comments in include/ass_graphics define coordinates, bounds and ownership.
 

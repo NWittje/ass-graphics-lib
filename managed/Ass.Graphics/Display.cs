@@ -42,7 +42,7 @@ namespace Ass.Graphics;
  public uint Size,Version;public fixed char Monitor[128];public int Left,Top,Right,Bottom;public uint Dpi,Mode;
 }
 /// <summary>UI-thread D2D source with D3D11 effects. Descriptors are copied during calls.</summary>
-public sealed unsafe class Display : GraphicsObject {
+public sealed unsafe partial class Display : GraphicsObject {
  public Display(GraphicsContext context,DisplayDesc desc,nint parent=0,Rect bounds=default){nint h;GraphicsError.Check(Native.ag_display_create(context.Raw,parent,bounds,&desc,&h));Handle=new(h,context.Handle);}
  public DisplayCandidate Prepare(DisplayDesc? desc=null,EffectGraph* graph=null){nint handle;DisplayDesc value=desc.GetValueOrDefault();GraphicsError.Check(Native.ag_display_prepare(H,desc.HasValue?&value:null,graph,&handle));return new DisplayCandidate(this,handle);}
  public void Commit(DisplayCandidate candidate)=>GraphicsError.Check(Native.ag_display_commit(H,candidate.Raw));

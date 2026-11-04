@@ -1,6 +1,7 @@
 #pragma once
 #include "graphics.hpp"
 #include "replay.h"
+#include "stencil.h"
 namespace ass::graphics
 {
 class DisplayCandidate : public Object
@@ -13,8 +14,8 @@ class DisplayCandidate : public Object
     void constants(uint32_t pass, uint32_t slot, std::span<const std::byte> data,
                    std::span<const ag_constant_binding> bindings = {})
     {
-        check(ag_display_candidate_constants(handle(), pass, slot, data.data(), uint32_t(data.size()), bindings.data(),
-                                             uint32_t(bindings.size())));
+        check(ag_display_candidate_constants(handle(), pass, slot, data.data(), uint32_t(data.size()),
+                                             bindings.data(), uint32_t(bindings.size())));
     }
 };
 class Display : public Object
@@ -55,11 +56,29 @@ class Display : public Object
     void submit(std::span<const ag_draw> draws, std::span<const ag_point> points = {},
                 std::span<const ag_path_draw> paths = {})
     {
-        check(ag_display_submit(handle(), draws.data(), uint32_t(draws.size()), points.data(), uint32_t(points.size()),
-                                paths.data(), uint32_t(paths.size())));
+        check(ag_display_submit(handle(), draws.data(), uint32_t(draws.size()), points.data(),
+                                uint32_t(points.size()), paths.data(), uint32_t(paths.size())));
     }
-    void submit_replay(const ag_replay_snapshot &snapshot){check(ag_display_submit_replay(handle(), &snapshot));}
-    ag_replay_metrics replay_metrics()const{ag_replay_metrics m{sizeof(m),1};check(ag_display_replay_metrics(handle(), &m));return m;}
+    void submit_replay(const ag_replay_snapshot &snapshot)
+    {
+        check(ag_display_submit_replay(handle(), &snapshot));
+    }
+    void submit_stencil(const ag_stencil_snapshot &snapshot)
+    {
+        check(ag_display_submit_stencil(handle(), &snapshot));
+    }
+    ag_stencil_metrics stencil_metrics() const
+    {
+        ag_stencil_metrics m{sizeof(m), 1};
+        check(ag_display_stencil_metrics(handle(), &m));
+        return m;
+    }
+    ag_replay_metrics replay_metrics() const
+    {
+        ag_replay_metrics m{sizeof(m), 1};
+        check(ag_display_replay_metrics(handle(), &m));
+        return m;
+    }
     void effects(const ag_effect_graph *graph = nullptr)
     {
         check(ag_display_effects(handle(), graph));
