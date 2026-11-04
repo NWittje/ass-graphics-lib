@@ -1,6 +1,7 @@
 #include "internal.hpp"
 #include "replay_impl.hpp"
 #include "stencil_impl.hpp"
+#include "ordered_impl.hpp"
 #include "display_ps.h"
 #include "display_vs.h"
 #include <chrono>
@@ -209,6 +210,12 @@ struct Display final : Surface
     Painter painter;
     ReplayRenderer replay{context};
     StencilRenderer stencil{context};
+    OrderedRenderer ordered{context};
+    bool ordered_opt_in{};
+    uint64_t ordered_texture_bytes() const
+    {
+        return ordered_opt_in ? ordered.texture_bytes(desc.source_width, desc.source_height) : 0;
+    }
     bool stencil_active{};
     bool replay_active{};
     bool source_dirty{true}, prepared{}, offscreen{}, targets_dirty{true}, render_active{};
@@ -418,7 +425,8 @@ struct Display final : Surface
 #ifdef _DEBUG
             flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
-            D3D_FEATURE_LEVEL requested = D3D_FEATURE_LEVEL_11_0, actual{};
+            D3D_FEATURE_LEVEL requested = ordered_opt_in ? D3D_FEATURE_LEVEL_11_1 : D3D_FEATURE_LEVEL_11_0,
+                              actual{};
             auto create = [&]
             {
                 return D3D11CreateDevice(nullptr, desc.warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
@@ -432,6 +440,13 @@ struct Display final : Surface
                 hr = create();
             }
             check(hr, L"Display requires a D3D11 FL11 device");
+            if (ordered_opt_in)
+            {
+                ordered.caps = OrderedRenderer::observe(device.Get());
+                require(ordered.caps.available,
+                        L"Ordered materials require FL11.1, ROV and R32_UINT UAV load/store",
+                        DXGI_ERROR_UNSUPPORTED);
+            }
             ComPtr<IDXGIDevice> dxgi;
             check(device.As(&dxgi), L"Display DXGI device failed");
             check(context->d2d->CreateDevice(dxgi.Get(), &d2d), L"Display shared D2D device failed");
@@ -492,7 +507,8 @@ struct Display final : Surface
             if (!mip || (x == 1 && y == 1))
                 break;
         }
-        auto retained = targets.bytes + candidate_bytes + replay.image_bytes() + stencil.texture_bytes();
+        auto retained = targets.bytes + candidate_bytes + replay.image_bytes() + stencil.texture_bytes() +
+                        ordered_texture_bytes();
         require(retained <= desc.texture_budget && bytes <= desc.texture_budget - retained &&
                     allocation <= desc.texture_budget - retained - bytes,
                 L"Display texture budget exceeded", E_OUTOFMEMORY);
@@ -697,14 +713,16 @@ struct Display final : Surface
             targets = std::move(next);
             targets_dirty = false;
             lookup_dirty = 0; // Preparation uploaded every retained CPU shadow.
-            require(targets.bytes + candidate_bytes + replay.image_bytes() + stencil.texture_bytes() <=
+            require(targets.bytes + candidate_bytes + replay.image_bytes() + stencil.texture_bytes() +
+                            ordered_texture_bytes() <=
                         desc.texture_budget,
                     L"Replay texture budget exceeded", E_OUTOFMEMORY);
         }
         else if (needs_swap())
             swap_resize(output_w, output_h);
         // Report the active targets even when an earlier graph install prepared them.
-        stats.texture_bytes = targets.bytes + replay.image_bytes() + stencil.texture_bytes();
+        stats.texture_bytes =
+            targets.bytes + replay.image_bytes() + stencil.texture_bytes() + ordered_texture_bytes();
         stats.source_width = targets.source.w;
         stats.source_height = targets.source.h;
         stats.viewport_width = targets.vw;
@@ -760,11 +778,34 @@ struct Display final : Surface
         stats.suspended = !output_w || !output_h ||
                           (!offscreen && (!IsWindowVisible(hwnd) || IsIconic(GetAncestor(hwnd, GA_ROOT))));
         if (stats.suspended)
+        {
+            if (ordered_opt_in && hwnd)
+                KillTimer(hwnd, 0xcdb);
             return;
+        }
         auto start = std::chrono::steady_clock::now();
         auto allocations = cpp_allocations;
         const bool rebuild = targets_dirty || !device || needs_swap();
         ensure();
+        bool ordered_changed = false;
+        if (ordered_opt_in)
+        {
+            if (source_dirty && !ordered.stats.available)
+            {
+                const float black[4]{0, 0, 0, 1};
+                immediate->ClearRenderTargetView(targets.source.target.Get(), black);
+            }
+            ordered_changed = ordered.progress(device.Get(), immediate.Get(), drawing.Get(),
+                                               targets.source.texture.Get(), vertex.Get());
+            source_dirty = source_dirty || ordered_changed;
+            if (hwnd)
+            {
+                if (ordered.stats.pending)
+                    SetTimer(hwnd, 0xcdb, 16, nullptr);
+                else
+                    KillTimer(hwnd, 0xcdb);
+            }
+        }
         // Rebuilt output/pass targets have no cached result, even when the fixed
         // source was reused and preparation already uploaded every lookup.
         if (replay_active && !force && !rebuild && !source_dirty && !lookup_dirty && !graph.temporal &&
@@ -799,7 +840,11 @@ struct Display final : Surface
         }
         if (source_dirty)
         {
-            if (stencil_active)
+            if (ordered_opt_in)
+            {
+                // progress() alone commits a GPU-completed colour candidate.
+            }
+            else if (stencil_active)
                 stencil.draw(device.Get(), immediate.Get(), drawing.Get(), targets.source.texture.Get());
             else
             {
@@ -960,6 +1005,17 @@ struct Display final : Surface
     }
     void timer(UINT_PTR id) override
     {
+        if (id == 0xcdb)
+        {
+            if (!IsWindowVisible(hwnd) || IsIconic(GetAncestor(hwnd, GA_ROOT)))
+            {
+                KillTimer(hwnd, id);
+                return;
+            }
+            if (!ordered.stats.pending)
+                KillTimer(hwnd, id);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
         if (id == 0xcda)
         {
             KillTimer(hwnd, id);
@@ -998,9 +1054,12 @@ struct Display final : Surface
     }
     void reset() override
     {
+        ordered.reset();
         stencil.reset();
         replay.reset();
         ++revision;
+        if (hwnd)
+            KillTimer(hwnd, 0xcdb);
         if (hwnd)
             KillTimer(hwnd, 0xcda);
         if (immediate)
@@ -1117,6 +1176,122 @@ Display *display(ag_handle h)
 } // namespace
 } // namespace ag
 using namespace ag;
+namespace
+{
+Display *ordered_display(ag_handle h)
+{
+    auto p = display(h);
+    require(p->ordered_opt_in && !p->render_active, L"Ordered operation requires an idle ordered display");
+    return p;
+}
+} // namespace
+ag_result ag_ordered_display_create(ag_handle h, void *parent, ag_rect bounds, const ag_display_desc *d,
+                                    ag_handle *out, ag_ordered_caps *observed)
+{
+    return api(
+        [&]
+        {
+            output(out);
+            if (observed)
+            {
+                descriptor(observed);
+                *observed = {sizeof(*observed), 1};
+            }
+            auto c = get<Context>(h, Kind::Context);
+            c->ui();
+            auto settings = config(d);
+            require(settings.raster_policy == AG_RASTER_FIXED, L"Ordered display requires a fixed source");
+            auto p = std::make_unique<Display>(c, settings);
+            p->ordered_opt_in = true;
+            p->replay_active = true;
+            p->offscreen = parent == nullptr;
+            if (parent)
+            {
+                p->create(static_cast<HWND>(parent), bounds);
+                p->resize();
+            }
+            try
+            {
+                p->initialize();
+            }
+            catch (...)
+            {
+                if (observed)
+                    *observed = p->ordered.caps;
+                throw;
+            }
+            if (observed)
+                *observed = p->ordered.caps;
+            *out = p.release();
+        });
+}
+ag_result ag_ordered_capabilities(ag_handle h, ag_ordered_caps *out)
+{
+    return api(
+        [&]
+        {
+            descriptor(out);
+            auto p = ordered_display(h);
+            p->initialize();
+            *out = p->ordered.caps;
+        });
+}
+ag_result ag_ordered_program_create(ag_handle h, const ag_ordered_program_desc *d, ag_handle *out)
+{
+    return api(
+        [&]
+        {
+            output(out);
+            descriptor(d);
+            auto p = ordered_display(h);
+            auto program = p->ordered.program(*d);
+            *out = new OrderedProgram(p->context, std::move(program), p->ordered.identity);
+        });
+}
+ag_result ag_ordered_submit(ag_handle h, const ag_ordered_snapshot *s)
+{
+    return api(
+        [&]
+        {
+            descriptor(s);
+            auto p = ordered_display(h);
+            auto program = get<OrderedProgram>(s->program, Kind::OrderedProgram);
+            program->ui();
+            require(program->owner.lock() == p->ordered.identity,
+                    L"Ordered program belongs to another display");
+            const auto retained = p->targets.bytes + p->candidate_bytes;
+            require(retained <= p->desc.texture_budget, L"Ordered texture budget exhausted", E_OUTOFMEMORY);
+            p->ordered.submit(*s, program->data, p->desc.source_width, p->desc.source_height,
+                              p->desc.logical_width, p->desc.logical_height,
+                              p->desc.texture_budget - retained);
+            if (p->hwnd)
+                InvalidateRect(p->hwnd, nullptr, FALSE);
+        });
+}
+ag_result ag_ordered_replay(ag_handle h, uint64_t sequence)
+{
+    return api(
+        [&]
+        {
+            auto p = ordered_display(h);
+            require(p->ordered.latest && sequence > p->ordered.requested,
+                    L"Ordered replay requires a retained recipe and increasing sequence");
+            p->ordered.requested = sequence;
+            p->ordered.stats.accepted = sequence;
+            if (p->hwnd)
+                InvalidateRect(p->hwnd, nullptr, FALSE);
+        });
+}
+ag_result ag_ordered_state_get(ag_handle h, ag_ordered_state *out)
+{
+    return api(
+        [&]
+        {
+            descriptor(out);
+            auto p = ordered_display(h);
+            *out = p->ordered.stats;
+        });
+}
 ag_result ag_display_create(ag_handle h, void *parent, ag_rect bounds, const ag_display_desc *d,
                             ag_handle *out)
 {
@@ -1143,6 +1318,8 @@ ag_result ag_display_configure(ag_handle h, const ag_display_desc *d)
         [&]
         {
             auto p = display(h);
+            require(!p->ordered_opt_in,
+                    L"Ordered source configuration is fixed; use output size/effects instead");
             auto next = config(d);
             require(!p->stencil_active ||
                         (next.raster_policy == AG_RASTER_FIXED && next.source_width == p->desc.source_width &&
@@ -1196,6 +1373,7 @@ ag_result ag_display_submit(ag_handle h, const ag_draw *cmd, uint32_t n, const a
         [&]
         {
             auto p = display(h);
+            require(!p->ordered_opt_in, L"Ordered display requires ordered submission");
             auto next = copy_snapshot(p->context, cmd, n, points, pn, paths, path_count);
             if (p->stencil_active)
             {
@@ -1219,13 +1397,16 @@ ag_result ag_display_submit_replay(ag_handle h, const ag_replay_snapshot *s)
         {
             auto p = display(h);
             descriptor(s);
-            require(p->targets.bytes + p->candidate_bytes + p->stencil.texture_bytes() <=
+            require(p->targets.bytes + p->candidate_bytes + p->stencil.texture_bytes() +
+                            p->ordered_texture_bytes() <=
                         p->desc.texture_budget,
                     L"Replay texture budget exceeded", E_OUTOFMEMORY);
-            bool changed = p->replay.submit(*s, p->desc.texture_budget - p->targets.bytes -
-                                                    p->candidate_bytes - p->stencil.texture_bytes());
+            require(!p->ordered_opt_in, L"Ordered display requires ordered submission");
+            bool changed =
+                p->replay.submit(*s, p->desc.texture_budget - p->targets.bytes - p->candidate_bytes -
+                                         p->stencil.texture_bytes() - p->ordered_texture_bytes());
             require(p->targets.bytes + p->candidate_bytes + p->replay.image_bytes() +
-                            p->stencil.texture_bytes() <=
+                            p->stencil.texture_bytes() + p->ordered_texture_bytes() <=
                         p->desc.texture_budget,
                     L"Replay texture budget exceeded", E_OUTOFMEMORY);
             changed = changed || !p->replay_active || p->stencil_active;
@@ -1255,6 +1436,7 @@ ag_result ag_display_submit_stencil(ag_handle h, const ag_stencil_snapshot *s)
             descriptor(s);
             require(p->desc.raster_policy == AG_RASTER_FIXED,
                     L"Stencil scenes require a fixed source raster");
+            require(!p->ordered_opt_in, L"Ordered display requires ordered submission");
             require(!p->render_active, L"Cannot replace stencil scene during rendering", E_UNEXPECTED);
             require(p->revision != UINT64_MAX, L"Display revision exhausted", E_FAIL);
             auto retained = p->targets.bytes + p->candidate_bytes + p->replay.image_bytes();
@@ -1305,7 +1487,7 @@ ag_result ag_display_effects(ag_handle h, const ag_effect_graph *g)
             p->initialize();
             for (auto &pass : next.passes)
                 p->shader(pass);
-            auto t = p->prepare(next, p->output_w, p->output_h);
+            auto t = p->prepare(next, p->output_w, p->output_h, p->ordered_opt_in);
             p->drawing->SetTarget(nullptr);
             p->painter.reset();
             p->graph = std::move(next);
@@ -1356,6 +1538,11 @@ ag_result ag_display_render(ag_handle h, double seconds)
             catch (const Failure &e)
             {
                 p->stats.error = uint32_t(e.hr);
+                if (p->ordered_opt_in)
+                {
+                    p->ordered.stats.failure = e.hr;
+                    p->ordered.stats.device_lost = p->device && FAILED(p->device->GetDeviceRemovedReason());
+                }
                 if (e.hr == DXGI_ERROR_DEVICE_REMOVED || e.hr == DXGI_ERROR_DEVICE_RESET ||
                     e.hr == D2DERR_RECREATE_TARGET)
                 {
@@ -1382,7 +1569,8 @@ ag_result ag_display_metrics_get(ag_handle h, ag_display_metrics *out)
             if (p->immediate)
                 p->query_collect();
             *out = p->stats;
-            out->texture_bytes = p->targets.bytes + p->replay.image_bytes() + p->stencil.texture_bytes();
+            out->texture_bytes = p->targets.bytes + p->replay.image_bytes() + p->stencil.texture_bytes() +
+                                 p->ordered_texture_bytes();
             out->source_width = p->targets.source.w;
             out->source_height = p->targets.source.h;
             out->viewport_width = p->targets.vw;
@@ -1422,6 +1610,7 @@ ag_result ag_display_prepare(ag_handle h, const ag_display_desc *d, const ag_eff
             require(p->candidate_count < 4,
                     L"Four display candidates already prepared; abort unused candidates");
             p->initialize();
+            require(!p->ordered_opt_in, L"Ordered display uses direct effects configuration");
             auto c = std::make_unique<Candidate>(p);
             if (d)
                 c->desc = config(d);

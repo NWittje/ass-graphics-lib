@@ -390,7 +390,8 @@ struct StencilRenderer
             cache.push_back(m);
         return m;
     }
-    bool submit(const ag_stencil_snapshot &s, uint32_t w, uint32_t h, float lw, float lh, uint64_t available)
+    bool submit(const ag_stencil_snapshot &s, uint32_t w, uint32_t h, float lw, float lh, uint64_t available,
+                bool gpu_paths = false, uint64_t cpu_allowance = cpu_limit)
     {
         auto begin = std::chrono::steady_clock::now();
         require(s.size == sizeof(s) && s.version == 1 && s.flags == AG_STENCIL_COMPLETE &&
@@ -585,7 +586,7 @@ struct StencilRenderer
                                 (rs.tile || r.kind == AG_REPLAY_CLEAR || (rs.argb >> 24) == 255),
                             L"Masked/tiled paint requires opaque aliased paths");
             }
-            if (o.kind != AG_STENCIL_REPLAY || o.state.test ||
+            if (gpu_paths || o.kind != AG_STENCIL_REPLAY || o.state.test ||
                 (o.state.tile && o.comparison != AG_REPLAY_CLEAR))
             {
                 o.mesh = mesh(o, n, s.mesh_vertex_limit - uint32_t(n.vertices));
@@ -595,9 +596,10 @@ struct StencilRenderer
                         E_OUTOFMEMORY);
             }
             n.operations.push_back(std::move(o));
-            require(cpu_bytes(&n) <= cpu_limit, L"Stencil CPU replacement budget exceeded", E_OUTOFMEMORY);
+            require(cpu_bytes(&n) <= cpu_allowance, L"Stencil CPU replacement budget exceeded",
+                    E_OUTOFMEMORY);
         }
-        require(cpu_bytes(&n) <= cpu_limit, L"Stencil CPU replacement budget exceeded", E_OUTOFMEMORY);
+        require(cpu_bytes(&n) <= cpu_allowance, L"Stencil CPU replacement budget exceeded", E_OUTOFMEMORY);
         const bool changed = scene.key != n.key;
         if (changed)
         {

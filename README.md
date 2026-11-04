@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.5.2 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.6.0 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 
@@ -33,6 +33,7 @@ The shared preparation folder uses the exact empty marker place_norm_and_b612_he
 | Simple orientation/platform preview | CPU wire projection plus Canvas lines |
 | Solid engineering 3D | Scene: Direct3D11 mesh/camera/depth, wireframe, lighting, blur and shared Direct2D overlays |
 | Ordered mask-dependent vector paint | Display stencil scenes: two independent byte masks, retained GPU path meshes, opaque paint and complete reset replay |
+| Stateful integer pixel materials | OrderedDisplay: explicit FL11.1/ROV, copied trusted programs/records, retained path coverage, two integer planes and one resolve |
 
 Window-backed Displays support installing a graph before their first render. An eligible visible render ensures the HWND swap chain independently of effect-target preparation; no preliminary render or resize workaround is needed. Stable chains are reused. See docs/window-presentation.md in the SDK for first-use, suspension and reset qualification.
 
@@ -115,3 +116,5 @@ Scene is a small engineering renderer: no scene graph, model importer, material 
 B612 binaries are not embedded or redistributed in this SDK or source tree. Obtain the upright proportional B612-Regular.ttf and B612-Bold.ttf from https://github.com/polarsys/b612 (not B612 Mono or italic variants). The retained upstream attribution and SIL Open Font License are in licenses/B612-OFL.txt. licenses/NOTICE.txt covers attribution and the in-house source's proprietary status. No new open-source license is granted merely by publishing this repository.
 
 This source publication does not establish Windows 10, physical mixed-monitor, simulator or hardware acceptance, and makes no new performance claim.
+
+Ordered integer materials use the additive ordered.h / ordered.hpp API and Ordered.cs source bindings. This explicit FL11.1/ROV lane has no automatic software fallback; desc.warp selects WARP diagnostics deliberately. CPU acceptance, actual submission and GPU completion are distinct; the last completed image remains on candidate rejection. See docs/ordered-materials.md in the SDK for trusted shader bindings, logical-part coverage, ownership, limits and measured qualification.
