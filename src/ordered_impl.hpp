@@ -4,6 +4,7 @@
 #include <d3d11_3.h>
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
+#include "ordered_images_impl.hpp"
 
 namespace ag
 {
@@ -11,6 +12,7 @@ namespace ag
 // contract; it cannot prove bounded execution or same-pixel addressing.
 struct OrderedProgramData
 {
+    uint32_t contract{1}, image_mask{};
     std::vector<uint8_t> material, resolve, constants;
     ComPtr<ID3D11PixelShader> material_gpu, resolve_gpu;
     ComPtr<ID3D11Buffer> constants_gpu;
@@ -46,7 +48,8 @@ struct OrderedProgramData
         }
         device = d;
     }
-    static void reflect(const std::vector<uint8_t> &code, bool material, uint32_t constants)
+    static uint32_t reflect(const std::vector<uint8_t> &code, bool material, uint32_t constants,
+                            uint32_t contract = 1)
     {
         ComPtr<ID3D11ShaderReflection> r;
         check(D3DReflect(code.data(), code.size(), IID_PPV_ARGS(&r)), L"Ordered shader reflection failed");
@@ -103,6 +106,10 @@ struct OrderedProgramData
             else if (material && b.Type == D3D_SIT_STRUCTURED && b.BindPoint == 0 &&
                      b.Dimension == D3D_SRV_DIMENSION_BUFFER)
                 bit = 4;
+            else if (material && contract == 2 && b.Type == D3D_SIT_TEXTURE &&
+                     b.BindPoint >= 1 && b.BindPoint <= 2 &&
+                     b.Dimension == D3D_SRV_DIMENSION_TEXTURE2D && b.ReturnType == D3D_RETURN_TYPE_UINT)
+                bit = 16u << (b.BindPoint - 1);
             else if (b.Type == (material ? D3D_SIT_UAV_RWTYPED : D3D_SIT_TEXTURE) && b.BindPoint < 2 &&
                      b.Dimension == D3D_SRV_DIMENSION_TEXTURE2D && b.ReturnType == D3D_RETURN_TYPE_UINT)
                 bit = 1u << b.BindPoint;
@@ -111,6 +118,7 @@ struct OrderedProgramData
         }
         require((bindings & 7) == (material ? 7u : 3u), L"Missing ordered resource binding");
         // A shared constants block may be optimized out of either program.
+        return (bindings >> 4) & 3;
     }
 };
 struct OrderedProgram final : Object
@@ -138,6 +146,7 @@ struct OrderedRenderer
     {
         std::unique_ptr<StencilRenderer> coverage;
         std::shared_ptr<OrderedProgramData> program;
+        std::array<std::shared_ptr<OrderedImageData>, 2> images;
         std::vector<Vertex> vertices;
         std::vector<Run> runs;
         std::vector<ag_ordered_record> records;
@@ -161,6 +170,7 @@ struct OrderedRenderer
     Context *context;
     std::shared_ptr<int> identity = std::make_shared<int>(0);
     std::vector<std::weak_ptr<OrderedProgramData>> programs;
+    std::vector<std::weak_ptr<OrderedImageData>> images;
     std::shared_ptr<Scene> latest, pending, bound;
     StencilRenderer lane;
     uint64_t lane_cpu_bytes;
@@ -214,11 +224,15 @@ struct OrderedRenderer
     }
     uint64_t texture_bytes(uint32_t w, uint32_t h) const
     {
-        return uint64_t(w) * h * 20;
+        uint64_t bytes = uint64_t(w) * h * 20;
+        for (auto &entry : images)
+            if (auto image = entry.lock()) bytes += image->texture_bytes();
+        return bytes;
     }
     uint64_t cpu_bytes(const Scene *extra = nullptr) const
     {
-        uint64_t bytes = sizeof(*this) + programs.capacity() * sizeof(programs[0]);
+        uint64_t bytes = sizeof(*this) + programs.capacity() * sizeof(programs[0]) +
+                         images.capacity() * sizeof(images[0]);
         std::set<const Scene *> scenes;
         for (auto p : std::array<const Scene *, 4>{latest.get(), pending.get(), bound.get(), extra})
             if (p)
@@ -228,6 +242,8 @@ struct OrderedRenderer
         for (auto &p : programs)
             if (auto v = p.lock())
                 bytes += v->bytes();
+        for (auto &p : images)
+            if (auto v = p.lock()) bytes += v->bytes();
         // The GPU lane holds another shallow operation/resource list; geometry
         // lives in the scene above and is deliberately counted conservatively.
         bytes += lane_cpu_bytes;
@@ -235,7 +251,8 @@ struct OrderedRenderer
     }
     std::shared_ptr<OrderedProgramData> program(const ag_ordered_program_desc &d)
     {
-        require(d.size == sizeof(d) && d.version == 1 && d.contract == 1 && d.trusted == 1 && d.material &&
+        require(d.size == sizeof(d) && d.version == 1 && (d.contract == 1 || d.contract == 2) &&
+                    d.trusted == 1 && d.material &&
                     d.resolve && d.material_bytes && d.resolve_bytes && d.material_bytes <= 1048576 &&
                     d.resolve_bytes <= 1048576 && d.constant_bytes <= 4096 && !(d.constant_bytes % 16) &&
                     (!d.constant_bytes || d.constants) && !d.reserved0 && !d.reserved[0] && !d.reserved[1],
@@ -243,6 +260,7 @@ struct OrderedRenderer
         std::erase_if(programs, [](auto &p) { return p.expired(); });
         require(programs.size() < 16, L"Too many retained ordered programs", E_OUTOFMEMORY);
         auto p = std::make_shared<OrderedProgramData>();
+        p->contract = d.contract;
         p->material.assign(static_cast<const uint8_t *>(d.material),
                            static_cast<const uint8_t *>(d.material) + d.material_bytes);
         p->resolve.assign(static_cast<const uint8_t *>(d.resolve),
@@ -250,13 +268,42 @@ struct OrderedRenderer
         if (d.constant_bytes)
             p->constants.assign(static_cast<const uint8_t *>(d.constants),
                                 static_cast<const uint8_t *>(d.constants) + d.constant_bytes);
-        OrderedProgramData::reflect(p->material, true, d.constant_bytes);
+        p->image_mask = OrderedProgramData::reflect(p->material, true, d.constant_bytes, d.contract);
         OrderedProgramData::reflect(p->resolve, false, d.constant_bytes);
         require(cpu_bytes() + p->bytes() + 16 * sizeof(programs[0]) <= StencilRenderer::cpu_limit,
                 L"Ordered program CPU budget exceeded", E_OUTOFMEMORY);
         programs.reserve(16);
         programs.push_back(p);
         stats.cpu_bytes = cpu_bytes();
+        return p;
+    }
+    std::shared_ptr<OrderedImageData> image(const ag_ordered_image_desc &desc, ID3D11Device *device,
+                                           uint32_t w, uint32_t h, uint64_t available)
+    {
+        const auto packed = OrderedImageData::qualify(desc);
+        std::erase_if(images, [](auto &entry) { return entry.expired(); });
+        require(images.size() < 16, L"Too many retained ordered images", E_OUTOFMEMORY);
+        require(texture_bytes(w, h) <= available && packed <= available - texture_bytes(w, h),
+                L"Ordered image texture budget exceeded", E_OUTOFMEMORY);
+        require(cpu_bytes() + sizeof(OrderedImageData) + packed + 16 * sizeof(images[0]) <=
+                    StencilRenderer::cpu_limit, L"Ordered image CPU budget exceeded", E_OUTOFMEMORY);
+        auto p = std::make_shared<OrderedImageData>();
+        p->width = desc.width; p->height = desc.height;
+        p->pixels.resize(size_t(packed / 4));
+        require(cpu_bytes() + p->bytes() + 16 * sizeof(images[0]) <= StencilRenderer::cpu_limit,
+                L"Ordered image allocated CPU budget exceeded", E_OUTOFMEMORY);
+        for (uint32_t y = 0; y < desc.height; ++y)
+            memcpy(p->pixels.data() + size_t(y) * desc.width,
+                   static_cast<const uint8_t *>(desc.pixels) + size_t(y) * desc.stride, size_t(desc.width) * 4);
+        if (owner.Get() != device)
+        {
+            reset();
+            owner = device;
+            caps = observe(device);
+            require(caps.available, L"Ordered image device support unavailable", DXGI_ERROR_UNSUPPORTED);
+        }
+        p->prepare(device, stats.resource_creations);
+        images.reserve(16); images.push_back(p); stats.cpu_bytes = cpu_bytes();
         return p;
     }
     static bool compatible(const StencilRenderer::Operation &a, const StencilRenderer::Operation &b)
@@ -274,9 +321,12 @@ struct OrderedRenderer
                (!ar || !memcmp(&a.state.clip->scissor, &b.state.clip->scissor, sizeof(D3D11_RECT)));
     }
     void submit(const ag_ordered_snapshot &s, std::shared_ptr<OrderedProgramData> p, uint32_t w, uint32_t h,
-                float lw, float lh, uint64_t available)
+                float lw, float lh, uint64_t available,
+                std::array<std::shared_ptr<OrderedImageData>, 2> input_images = {})
     {
         auto admission_start = std::chrono::steady_clock::now();
+        for (unsigned i = 0; i < 2; ++i)
+            require(!(p->image_mask & (1u << i)) || input_images[i], L"Required ordered image slot is empty");
         require(s.size == sizeof(s) && s.version == 1 && s.sequence > requested && s.command_count <= 16383 &&
                     s.resource_count <= 4096 && (!s.command_count || s.commands) &&
                     (!s.resource_count || s.resources) && s.record_count && s.record_count <= 65536 &&
@@ -342,6 +392,7 @@ struct OrderedRenderer
         if (latest)
             next->coverage->inherit(*latest->coverage);
         next->program = std::move(p);
+        next->images = std::move(input_images);
         ag_stencil_snapshot stencil{sizeof(stencil),
                                     1,
                                     uint32_t(commands.size()),
@@ -430,6 +481,8 @@ struct OrderedRenderer
         for (auto &v : programs)
             if (auto p = v.lock())
                 p->reset();
+        for (auto &v : images)
+            if (auto p = v.lock()) p->reset();
         width = height = 0;
         issued = 0;
         stats.pending = stats.available = 0;
@@ -508,6 +561,8 @@ struct OrderedRenderer
         s->program->prepare(d);
         if (program_created)
             stats.resource_creations += 2 + !s->program->constants.empty();
+        for (auto &image : s->images)
+            if (image) image->prepare(d, stats.resource_creations);
         if (!s->records_gpu || !s->records_view)
         {
             s->records_view.Reset();
@@ -633,6 +688,13 @@ struct OrderedRenderer
                 gpu->PSSetShader(s->program->material_gpu.Get(), nullptr, 0);
                 auto view = s->records_view.Get();
                 gpu->PSSetShaderResources(0, 1, &view);
+                if (s->program->contract == 2)
+                {
+                    ID3D11ShaderResourceView *image_views[] = {
+                        s->images[0] ? s->images[0]->view.Get() : nullptr,
+                        s->images[1] ? s->images[1]->view.Get() : nullptr};
+                    gpu->PSSetShaderResources(1, 2, image_views);
+                }
                 cb = s->program->constants_gpu.Get();
                 gpu->PSSetConstantBuffers(1, 1, &cb);
                 gpu->Draw(run.count, run.first);

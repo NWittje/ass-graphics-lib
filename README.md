@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.6.2 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.6.3 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 
@@ -34,6 +34,7 @@ The shared preparation folder uses the exact empty marker place_norm_and_b612_he
 | Solid engineering 3D | Scene: Direct3D11 mesh/camera/depth, wireframe, lighting, blur and shared Direct2D overlays |
 | Ordered mask-dependent vector paint | Display stencil scenes: two independent byte masks, retained GPU path meshes, opaque paint and complete reset replay |
 | Stateful integer pixel materials | OrderedDisplay: explicit FL11.1/ROV, copied trusted programs/records, retained path coverage, two integer planes and one resolve |
+| Images interleaved with integer materials | OrderedImage and shader contract 2: immutable packed uint images, two point-load inputs, existing ordered masks and coverage |
 
 Window-backed Displays support installing a graph before their first render. An eligible visible render ensures the HWND swap chain independently of effect-target preparation; no preliminary render or resize workaround is needed. Stable chains are reused. See docs/window-presentation.md in the SDK for first-use, suspension and reset qualification.
 
@@ -122,3 +123,5 @@ Ordered integer materials use the additive ordered.h / ordered.hpp API and Order
 Version 1.6.1 creates complete source targets when an ordered effect graph is installed before the first render, including initially hidden child windows. Existing populated sources stay shared across graph changes, resize and zero-sized output suspension. A device reset recreates the source from the retained recipe. See docs/ordered-initialization.md in the SDK.
 
 Version 1.6.1 also adds sample-correlated display timing through timing.h / timing.hpp and the C# Timing extension. The legacy GPU metric now includes ordered rendering. Source GPU, graph/output GPU, CPU submission, CPU Present and independent CPU admission scopes remain distinct; sequence/flags distinguish new material submissions from cached viewport redraws. Collection stays nonblocking. See docs/display-timing.md in the SDK.
+
+Version 1.6.3 adds ordered_images.h / ordered_images.hpp and OrderedImages.cs. Create immutable R32_UINT image handles outside the frame loop, create a trusted contract 2 program using ordered_images_contract.hlsl, and submit with two explicit image slots. Existing FILL/STROKE coverage, clipping, masks, integer planes and draw ordering apply to image samples. The caller defines source coordinates, bounds treatment and packed-channel arithmetic. No per-pixel path expansion, automatic decoding or per-frame image upload is performed. Accepted/pending scenes retain image data after handles are released; device reset reconstructs from the copied pixels. Contract 1, its public headers and previous SDKs remain available. See docs/ordered-images.md in the SDK for limits, ownership, examples and measurement scope.

@@ -1421,6 +1421,7 @@ ag_result ag_ordered_submit(ag_handle h, const ag_ordered_snapshot *s)
             program->ui();
             require(program->owner.lock() == p->ordered.identity,
                     L"Ordered program belongs to another display");
+            require(program->data->contract == 1, L"Contract2 requires ordered image bindings");
             const auto retained = p->targets.bytes + p->candidate_bytes;
             require(retained <= p->desc.texture_budget, L"Ordered texture budget exhausted", E_OUTOFMEMORY);
             p->ordered.submit(*s, program->data, p->desc.source_width, p->desc.source_height,
@@ -1429,6 +1430,61 @@ ag_result ag_ordered_submit(ag_handle h, const ag_ordered_snapshot *s)
             if (p->hwnd)
                 InvalidateRect(p->hwnd, nullptr, FALSE);
         });
+}
+ag_result ag_ordered_image_create(ag_handle h, const ag_ordered_image_desc *d, ag_handle *out)
+{
+    return api([&]
+    {
+        output(out); descriptor(d);
+        auto p = ordered_display(h);
+        const auto held = p->targets.bytes + p->candidate_bytes;
+        require(held <= p->desc.texture_budget, L"Ordered image texture budget exhausted", E_OUTOFMEMORY);
+        p->initialize();
+        auto image = p->ordered.image(*d, p->device.Get(), p->desc.source_width, p->desc.source_height,
+                                      p->desc.texture_budget - held);
+        *out = new OrderedImage(p->context, std::move(image), p->ordered.identity);
+    });
+}
+ag_result ag_ordered_image_state_get(ag_handle h, ag_ordered_image_state *out)
+{
+    return api([&]
+    {
+        descriptor(out);
+        auto image = get<OrderedImage>(h, Kind::OrderedImage); image->ui();
+        require(!image->owner.expired(), L"Ordered image owner no longer exists");
+        const auto &d = *image->data;
+        *out = {sizeof(*out), 1, d.width, d.height, AG_ORDERED_IMAGE_R32_UINT,
+                uint32_t(d.device && d.texture && d.view), d.texture_bytes(), d.uploads, d.creations,
+                d.generation};
+    });
+}
+ag_result ag_ordered_submit_images(ag_handle h, const ag_ordered_snapshot *s,
+                                   const ag_ordered_image_bindings *bindings)
+{
+    return api([&]
+    {
+        descriptor(s); descriptor(bindings);
+        require(!bindings->reserved[0] && !bindings->reserved[1], L"Invalid ordered image bindings");
+        auto p = ordered_display(h);
+        auto program = get<OrderedProgram>(s->program, Kind::OrderedProgram); program->ui();
+        require(program->owner.lock() == p->ordered.identity && program->data->contract == 2,
+                L"Ordered image submission requires this display's contract2 program");
+        std::array<std::shared_ptr<OrderedImageData>, 2> images;
+        for (unsigned i = 0; i < 2; ++i)
+            if (bindings->image[i])
+            {
+                auto image = get<OrderedImage>(bindings->image[i], Kind::OrderedImage); image->ui();
+                require(image->owner.lock() == p->ordered.identity,
+                        L"Ordered image belongs to another display");
+                images[i] = image->data;
+            }
+        const auto held = p->targets.bytes + p->candidate_bytes;
+        require(held <= p->desc.texture_budget, L"Ordered texture budget exhausted", E_OUTOFMEMORY);
+        p->ordered.submit(*s, program->data, p->desc.source_width, p->desc.source_height,
+                          p->desc.logical_width, p->desc.logical_height,
+                          p->desc.texture_budget - held, std::move(images));
+        if (p->hwnd) InvalidateRect(p->hwnd, nullptr, FALSE);
+    });
 }
 ag_result ag_ordered_replay(ag_handle h, uint64_t sequence)
 {

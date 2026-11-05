@@ -117,7 +117,7 @@ enum class Kind
     Scene,
     Settings,
     Path,
-    Display, DisplayCandidate, OrderedProgram
+    Display, DisplayCandidate, OrderedProgram, OrderedImage
 };
 struct Context;
 struct Object
