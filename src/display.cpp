@@ -1486,6 +1486,42 @@ ag_result ag_ordered_submit_images(ag_handle h, const ag_ordered_snapshot *s,
         if (p->hwnd) InvalidateRect(p->hwnd, nullptr, FALSE);
     });
 }
+ag_result ag_ordered_submit_backend(ag_handle h, const ag_ordered_backend_snapshot *s)
+{
+    return api([&]
+    {
+        descriptor(s);
+        require(s->backend <= AG_BACKEND_VECTOR, L"Unknown ordered backend");
+        descriptor(&s->scene); descriptor(&s->images);
+        require(!s->images.reserved[0] && !s->images.reserved[1], L"Invalid backend image bindings");
+        require((!s->outer_width_count && !s->outer_widths) ||
+                (s->backend == AG_BACKEND_VECTOR && s->outer_widths && s->outer_width_count == s->scene.command_count),
+                L"Invalid backend coverage widths");
+        auto p=ordered_display(h);
+        auto program=get<OrderedProgram>(s->scene.program,Kind::OrderedProgram); program->ui();
+        require(program->owner.lock()==p->ordered.identity &&
+                (s->backend==AG_BACKEND_VECTOR ? program->data->contract==3 : program->data->contract<=2),
+                L"Backend/program contract mismatch");
+        std::array<std::shared_ptr<OrderedImageData>,2> images;
+        for(unsigned i=0;i<2;++i)if(s->images.image[i]) {
+            auto image=get<OrderedImage>(s->images.image[i],Kind::OrderedImage);image->ui();
+            require(image->owner.lock()==p->ordered.identity,L"Backend image belongs to another display");
+            images[i]=image->data;
+        }
+        require(p->desc.raster_policy==AG_RASTER_FIXED,
+                L"Ordered backend needs explicit physical source dimensions; configure on resize");
+        const auto held=p->targets.bytes+p->candidate_bytes;
+        require(held<=p->desc.texture_budget,L"Backend texture budget exhausted",E_OUTOFMEMORY);
+        p->ordered.submit(s->scene,program->data,p->desc.source_width,p->desc.source_height,
+                          p->desc.logical_width,p->desc.logical_height,p->desc.texture_budget-held,
+                          std::move(images),{s->outer_widths,s->outer_width_count});
+        if(p->hwnd)InvalidateRect(p->hwnd,nullptr,FALSE);
+    });
+}
+ag_result ag_ordered_coverage_metrics(ag_handle h, ag_coverage_metrics *out)
+{
+    return api([&] { descriptor(out); auto p=ordered_display(h); *out=p->ordered.atlas.metrics; });
+}
 ag_result ag_ordered_replay(ag_handle h, uint64_t sequence)
 {
     return api(

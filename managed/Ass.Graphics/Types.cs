@@ -81,7 +81,8 @@ public enum ControlKind : uint
     Panel,
     Tabs,
     Indicator,
-    Choice
+    Choice,
+    MultilineEdit = 12
 }
 public enum EventKind : uint
 {

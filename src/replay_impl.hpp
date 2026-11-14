@@ -1,5 +1,6 @@
 #pragma once
 #include "ass_graphics/replay.h"
+#include "cache_storage.hpp"
 #include <cstring>
 #include <limits>
 #include <unordered_map>
@@ -30,8 +31,9 @@ struct ReplayRenderer
 {
     Context *context;
     ReplayScene scene;
-    std::vector<std::shared_ptr<ReplayResource>> cache;
-    std::unordered_multimap<uint64_t, std::weak_ptr<ReplayResource>> lookup;
+    CacheQueue<std::shared_ptr<ReplayResource>> cache;
+    uint64_t cache_bytes{};
+    WeakCacheIndex<ReplayResource> lookup;
     ag_replay_metrics metrics{sizeof(ag_replay_metrics), 1};
     ID2D1DeviceContext *target{};
     explicit ReplayRenderer(Context *c) : context(c) {}
@@ -152,21 +154,10 @@ struct ReplayRenderer
             r->key.insert(r->key.end(), p, p + d.pixel_bytes);
         }
         auto keyhash = hash(r->key);
-        auto range = lookup.equal_range(keyhash);
-        for (auto i = range.first; i != range.second;)
+        if (auto c = lookup.find(keyhash, [&](const auto &entry) { return entry.key == r->key; }))
         {
-            auto c = i->second.lock();
-            if (!c)
-            {
-                i = lookup.erase(i);
-                continue;
-            }
-            if (c->key == r->key)
-            {
-                ++metrics.cache_hits;
-                return c;
-            }
-            ++i;
+            ++metrics.cache_hits;
+            return c;
         }
         if (r->kind == AG_REPLAY_PATH)
         {
@@ -240,24 +231,16 @@ struct ReplayRenderer
                   L"Replay stroke creation failed");
         }
         ++metrics.resource_creations;
-        size_t retained = 0;
-        for (auto &c : cache)
-            retained += c->bytes();
-        while (!cache.empty() && retained + r->bytes() > 3 * 1024 * 1024)
+        while (!cache.empty() && cache_bytes + r->bytes() > 3 * 1024 * 1024)
         {
-            retained -= cache.front()->bytes();
-            cache.erase(cache.begin());
+            cache_bytes -= cache.front()->bytes();
+            cache.pop_front();
         }
         if (r->bytes() <= 3 * 1024 * 1024)
         {
             cache.push_back(r);
+            cache_bytes += r->bytes();
             lookup.emplace(keyhash, r);
-            if (lookup.size() > 65536)
-            {
-                lookup.clear();
-                for (auto &v : cache)
-                    lookup.emplace(hash(v->key), v);
-            }
         }
         return r;
     }
@@ -364,9 +347,7 @@ struct ReplayRenderer
                 r->bitmap.Reset();
         metrics.cpu_bytes = bytes;
         metrics.commands = d.command_count;
-        metrics.cache_bytes = 0;
-        for (auto &c : cache)
-            metrics.cache_bytes += c->bytes();
+        metrics.cache_bytes = cache_bytes;
         return changed;
     }
     void reset()

@@ -160,9 +160,11 @@ struct Context final : Object
     std::map<uint64_t, HFONT> fonts;
     std::vector<Object *> objects;
     HWND reaper{};
+    HMODULE rich_edit{}; // System control module; released after all context children.
     Context();
     ~Context();
     void load_fonts();
+    const wchar_t *edit_class();
     HFONT font(float points = 0, bool bold = false, UINT dpi = 96);
     ComPtr<IDWriteTextFormat> format(float size, bool bold = false);
 };

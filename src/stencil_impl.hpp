@@ -19,6 +19,9 @@ struct StencilRenderer
         std::vector<uint8_t> key;
         std::vector<D2D1_POINT_2F> vertices;
         ComPtr<ID3D11Buffer> buffer;
+        ComPtr<ID2D1Geometry> geometry;
+        ComPtr<ID2D1Geometry> coverage_outer;
+        float coverage_outer_width{}, tolerance{};
         uint64_t bytes() const
         {
             return sizeof(*this) + key.capacity() + vertices.capacity() * sizeof(D2D1_POINT_2F);
@@ -30,6 +33,8 @@ struct StencilRenderer
         std::vector<uint8_t> key;
         bool rectangle{};
         D3D11_RECT scissor{};
+        bool axis_rectangle{};
+        D2D1_RECT_F device_rect{};
     };
     struct State
     {
@@ -62,9 +67,9 @@ struct StencilRenderer
     } scene;
     Context *context;
     ReplayRenderer resources;
-    std::vector<std::shared_ptr<Mesh>> cache;
+    CacheQueue<std::shared_ptr<Mesh>> cache;
     uint64_t cache_bytes{};
-    std::unordered_multimap<uint64_t, std::weak_ptr<Mesh>> mesh_lookup;
+    WeakCacheIndex<Mesh> mesh_lookup;
     std::vector<uint8_t> mesh_key;
     ag_stencil_metrics metrics{sizeof(ag_stencil_metrics), 1};
     ComPtr<ID3D11Device> owner;
@@ -92,6 +97,7 @@ struct StencilRenderer
         cache_bytes = previous.cache_bytes;
         mesh_lookup = previous.mesh_lookup;
         resources.cache = previous.resources.cache;
+        resources.cache_bytes = previous.resources.cache_bytes;
         resources.lookup = previous.resources.lookup;
         resources.scene.resources = previous.resources.scene.resources;
     }
@@ -146,60 +152,100 @@ struct StencilRenderer
     {
         return scene.w ? texture_bytes(scene) : 0;
     }
-    uint64_t cpu_bytes(const Scene *next = nullptr) const
+    // Count separate containers separately and immutable shared payload once.
+    // A retained parent describes other, still-live renderers while a new
+    // candidate is admitted. It never owns or extends payload lifetime.
+    struct CpuFootprint
     {
-        uint64_t n = sizeof(*this) + cache.capacity() * sizeof(std::shared_ptr<Mesh>) + mesh_key.capacity() +
-                     mesh_lookup.size() * 64 + mesh_lookup.bucket_count() * 16 +
-                     resources.scene.commands.capacity() * sizeof(ag_replay_command) +
-                     (resources.scene.resources.capacity() + resources.cache.capacity()) *
-                         sizeof(std::shared_ptr<ReplayResource>) +
-                     resources.lookup.size() * 64 + resources.lookup.bucket_count() * 16;
-        const auto operations = scene.operations.size() + (next ? next->operations.size() : 0);
-        std::vector<const Mesh *> meshes;
-        std::vector<const ReplayResource *> objects;
-        std::vector<const Clip *> clips;
-        meshes.reserve(operations + cache.size());
-        clips.reserve(operations);
-        objects.reserve(scene.resources.size() + (next ? next->resources.size() : 0) +
-                        resources.cache.size() + resources.scene.resources.size());
-        auto include = [&](const Scene &s)
+        const CpuFootprint *retained{};
+        PointerSet<const StencilRenderer *> renderers;
+        PointerSet<const Mesh *> meshes;
+        PointerSet<const ReplayResource *> objects;
+        PointerSet<const Clip *> clips;
+        PointerSet<const void *> indexes;
+        uint64_t bytes{};
+        explicit CpuFootprint(const CpuFootprint *parent = nullptr) : retained(parent) {}
+        bool holds(const Mesh *p) const
         {
-            n += s.operations.capacity() * sizeof(Operation) + s.key.capacity() +
-                 s.resources.capacity() * sizeof(std::shared_ptr<ReplayResource>);
+            return meshes.contains(p) || (retained && retained->holds(p));
+        }
+        bool holds(const ReplayResource *p) const
+        {
+            return objects.contains(p) || (retained && retained->holds(p));
+        }
+        bool holds(const Clip *p) const
+        {
+            return clips.contains(p) || (retained && retained->holds(p));
+        }
+        bool holds_index(const void *p) const
+        {
+            return indexes.contains(p) || (retained && retained->holds_index(p));
+        }
+        template <class T> void index(const WeakCacheIndex<T> &value)
+        {
+            bytes += value.private_storage_bytes();
+            auto identity = value.shared_storage_identity();
+            if (identity && indexes.insert(identity).second && !(retained && retained->holds_index(identity)))
+                bytes += value.shared_storage_bytes();
+        }
+        void mesh(const Mesh *p)
+        {
+            if (p && meshes.insert(p).second && !(retained && retained->holds(p)))
+                bytes += p->bytes();
+        }
+        void object(const ReplayResource *p)
+        {
+            if (p && objects.insert(p).second && !(retained && retained->holds(p)))
+                bytes += p->bytes();
+        }
+        void clip(const Clip *p)
+        {
+            if (p && clips.insert(p).second && !(retained && retained->holds(p)))
+                bytes += sizeof(*p) + p->key.capacity();
+        }
+        void scene(const Scene &s)
+        {
+            bytes += s.operations.capacity() * sizeof(Operation) + s.key.capacity() +
+                     s.resources.capacity() * sizeof(std::shared_ptr<ReplayResource>);
             for (auto &r : s.resources)
-                if (r)
-                    objects.push_back(r.get());
+                object(r.get());
             for (auto &o : s.operations)
             {
-                if (o.mesh)
-                    meshes.push_back(o.mesh.get());
-                if (o.state.clip)
-                    clips.push_back(o.state.clip.get());
+                mesh(o.mesh.get());
+                clip(o.state.clip.get());
             }
-        };
-        include(scene);
-        if (next)
-            include(*next);
-        for (auto &m : cache)
-            meshes.push_back(m.get());
-        for (auto &r : resources.cache)
-            objects.push_back(r.get());
-        for (auto &r : resources.scene.resources)
-            if (r)
-                objects.push_back(r.get());
-        auto unique_bytes = [](auto &values, auto payload)
+        }
+        void include(const StencilRenderer &r, const Scene *next = nullptr)
         {
-            std::sort(values.begin(), values.end(), std::less<>{});
-            const auto end = std::unique(values.begin(), values.end());
-            uint64_t bytes = 0;
-            for (auto i = values.begin(); i != end; ++i)
-                bytes += payload(*i);
-            return bytes;
-        };
-        n += unique_bytes(meshes, [](auto m) { return m->bytes(); });
-        n += unique_bytes(objects, [](auto r) { return r->bytes(); });
-        n += unique_bytes(clips, [](auto c) { return sizeof(Clip) + c->key.capacity(); });
-        return n;
+            if (!renderers.insert(&r).second)
+                return;
+            const auto operations = r.scene.operations.size() + (next ? next->operations.size() : 0);
+            meshes.reserve(operations + r.cache.size());
+            clips.reserve(operations);
+            objects.reserve(r.scene.resources.size() + (next ? next->resources.size() : 0) +
+                            r.resources.cache.size() + r.resources.scene.resources.size());
+            bytes += sizeof(r) + r.cache.capacity() * sizeof(std::shared_ptr<Mesh>) + r.mesh_key.capacity() +
+                     r.resources.scene.commands.capacity() * sizeof(ag_replay_command) +
+                     (r.resources.scene.resources.capacity() + r.resources.cache.capacity()) *
+                         sizeof(std::shared_ptr<ReplayResource>);
+            index(r.mesh_lookup);
+            index(r.resources.lookup);
+            scene(r.scene);
+            if (next)
+                scene(*next);
+            for (auto &m : r.cache)
+                mesh(m.get());
+            for (auto &v : r.resources.cache)
+                object(v.get());
+            for (auto &v : r.resources.scene.resources)
+                object(v.get());
+        }
+    };
+    uint64_t cpu_bytes(const Scene *next = nullptr, const CpuFootprint *retained = nullptr) const
+    {
+        CpuFootprint footprint(retained);
+        footprint.include(*this, next);
+        return footprint.bytes;
     }
     // Scene payloads are immutable once retained. Track the two ownership sets
     // while admitting a candidate instead of rebuilding them after each part.
@@ -207,12 +253,17 @@ struct StencilRenderer
     {
         const StencilRenderer &renderer;
         const Scene &candidate;
-        std::unordered_set<const Mesh *> referenced, cached;
-        std::unordered_set<const Clip *> clips;
+        PointerSet<const Mesh *> referenced, cached;
+        PointerSet<const Clip *> clips;
+        const CpuFootprint *retained;
         uint64_t fixed;
-        CpuBudget(const StencilRenderer &r, const Scene &s) : renderer(r), candidate(s)
+        CpuBudget(const StencilRenderer &r, const Scene &s, const CpuFootprint *parent = nullptr)
+            : renderer(r), candidate(s), retained(parent)
         {
-            fixed = r.cpu_bytes(&s) - containers();
+            fixed = r.cpu_bytes(&s, retained) - containers();
+            referenced.reserve(r.scene.operations.size());
+            clips.reserve(r.scene.operations.size());
+            cached.reserve(r.cache.size());
             for (auto &o : r.scene.operations)
             {
                 if (o.mesh)
@@ -225,26 +276,30 @@ struct StencilRenderer
         }
         uint64_t containers() const
         {
-            return renderer.cache.capacity() * sizeof(std::shared_ptr<Mesh>) +
-                   renderer.mesh_key.capacity() +
-                   renderer.mesh_lookup.size() * 64 + renderer.mesh_lookup.bucket_count() * 16 +
+            return renderer.cache.capacity() * sizeof(std::shared_ptr<Mesh>) + renderer.mesh_key.capacity() +
+                   renderer.mesh_lookup.private_storage_bytes() +
+                   (retained && retained->holds_index(renderer.mesh_lookup.shared_storage_identity())
+                        ? 0
+                        : renderer.mesh_lookup.shared_storage_bytes()) +
                    candidate.operations.capacity() * sizeof(Operation) + candidate.key.capacity();
         }
         void cache_insert(const Mesh &m)
         {
-            if (cached.insert(&m).second && !referenced.contains(&m))
+            if (cached.insert(&m).second && !referenced.contains(&m) && !(retained && retained->holds(&m)))
                 fixed += m.bytes();
         }
         void cache_erase(const Mesh &m)
         {
-            if (cached.erase(&m) && !referenced.contains(&m))
+            if (cached.erase(&m) && !referenced.contains(&m) && !(retained && retained->holds(&m)))
                 fixed -= m.bytes();
         }
         void include(const Operation &o)
         {
-            if (o.mesh && referenced.insert(o.mesh.get()).second && !cached.contains(o.mesh.get()))
+            if (o.mesh && referenced.insert(o.mesh.get()).second && !cached.contains(o.mesh.get()) &&
+                !(retained && retained->holds(o.mesh.get())))
                 fixed += o.mesh->bytes();
-            if (o.state.clip && clips.insert(o.state.clip.get()).second)
+            if (o.state.clip && clips.insert(o.state.clip.get()).second &&
+                !(retained && retained->holds(o.state.clip.get())))
                 fixed += sizeof(Clip) + o.state.clip->key.capacity();
         }
         uint64_t bytes() const
@@ -312,7 +367,7 @@ struct StencilRenderer
     };
     // An axis-aligned integer rectangle permits exact scissoring; a general clip
     // is intersected as geometry and is never replaced by its bounding box.
-    static bool rectangle(const ReplayResource &r, D2D1_MATRIX_3X2_F m, D3D11_RECT &rect)
+    static bool rectangle(const ReplayResource &r, D2D1_MATRIX_3X2_F m, D3D11_RECT &rect, D2D1_RECT_F *fractional=nullptr)
     {
         if (r.segments.size() != 5 || r.segments[0].kind != 0 || r.segments[4].kind != 4)
             return false;
@@ -324,7 +379,8 @@ struct StencilRenderer
             auto x = ReplayRenderer::f(r.segments[i].p[0]), y = ReplayRenderer::f(r.segments[i].p[1]);
             p[i] = {x * m._11 + y * m._21 + m._31, x * m._12 + y * m._22 + m._32};
             if (!finite(p[i].x) || !finite(p[i].y) || std::abs(p[i].x) > 10000000 ||
-                std::abs(p[i].y) > 10000000 || p[i].x != std::floor(p[i].x) || p[i].y != std::floor(p[i].y))
+                std::abs(p[i].y) > 10000000 || (!fractional &&
+                (p[i].x != std::floor(p[i].x) || p[i].y != std::floor(p[i].y))))
                 return false;
         }
         for (unsigned i = 0; i < 4; ++i)
@@ -333,6 +389,8 @@ struct StencilRenderer
             if ((a.x == b.x) == (a.y == b.y) || (a.x == b.x) == (b.x == c.x))
                 return false;
         }
+        if(fractional)*fractional={std::min({p[0].x,p[1].x,p[2].x,p[3].x}),std::min({p[0].y,p[1].y,p[2].y,p[3].y}),
+                                  std::max({p[0].x,p[1].x,p[2].x,p[3].x}),std::max({p[0].y,p[1].y,p[2].y,p[3].y})};
         rect = {LONG(std::min({p[0].x, p[1].x, p[2].x, p[3].x})),
                 LONG(std::min({p[0].y, p[1].y, p[2].y, p[3].y})),
                 LONG(std::max({p[0].x, p[1].x, p[2].x, p[3].x})),
@@ -356,6 +414,8 @@ struct StencilRenderer
               L"Stencil clip transform failed");
         c->geometry = tr;
         c->rectangle = rectangle(*path, s.matrix * n.root, c->scissor);
+        D3D11_RECT ignored{};
+        c->axis_rectangle = rectangle(*path,s.matrix*n.root,ignored,&c->device_rect);
         if (intersect && s.clip)
         {
             ComPtr<ID2D1PathGeometry> result;
@@ -368,6 +428,11 @@ struct StencilRenderer
             check(sink->Close(), L"Stencil clip completion failed");
             c->geometry = result;
             c->rectangle = c->rectangle && s.clip->rectangle;
+            c->axis_rectangle=c->axis_rectangle&&s.clip->axis_rectangle;
+            if(c->axis_rectangle){const auto a=s.clip->device_rect;
+                c->device_rect={std::max(a.left,c->device_rect.left),std::max(a.top,c->device_rect.top),
+                    std::max(std::max(a.left,c->device_rect.left),std::min(a.right,c->device_rect.right)),
+                    std::max(std::max(a.top,c->device_rect.top),std::min(a.bottom,c->device_rect.bottom))};}
             if (c->rectangle)
             {
                 auto a = s.clip->scissor;
@@ -379,14 +444,14 @@ struct StencilRenderer
         }
         return c;
     }
-    std::shared_ptr<Mesh> mesh(Operation &o, Scene &n, uint32_t limit, CpuBudget &budget)
+    std::shared_ptr<Mesh> mesh(Operation &o, Scene &n, uint32_t limit, CpuBudget &budget, bool coverage_only=false)
     {
         bool stroke = o.kind == AG_STENCIL_WRITE_STROKE ||
                       (o.kind == AG_STENCIL_REPLAY && o.comparison == AG_REPLAY_DRAW);
         require(!stroke || (o.state.stroke && o.state.stroke->width > 0),
                 L"Stencil strokes require positive width");
         auto transform = o.state.matrix * n.root;
-        const bool local = !o.state.clip || o.state.clip->rectangle;
+        const bool local = !o.state.clip || o.state.clip->rectangle || (coverage_only && o.state.clip->axis_rectangle);
         // Largest singular value converts the explicit raster tolerance into a
         // conservative local tolerance. Translation/rotation do not bake vertices.
         double a = transform._11, b = transform._12, c = transform._21, d = transform._22;
@@ -400,6 +465,7 @@ struct StencilRenderer
                     sizeof(stroke) + (stroke ? o.state.stroke->key.size() : 0) +
                     (local ? 0 : 2 * sizeof(D2D1_MATRIX_3X2_F) + o.state.clip->key.size()));
         add(key, local);
+        add(key, coverage_only);
         add(key, tolerance);
         add(key, o.path->key.size());
         key.insert(key.end(), o.path->key.begin(), o.path->key.end());
@@ -414,24 +480,14 @@ struct StencilRenderer
         }
         o.gpu = local ? transform : D2D1::Matrix3x2F::Identity();
         const auto keyhash = ReplayRenderer::hash(key);
-        auto range = mesh_lookup.equal_range(keyhash);
-        for (auto i = range.first; i != range.second;)
+        if (auto entry = mesh_lookup.find(keyhash, [&](const auto &value) { return value.key == key; }))
         {
-            auto entry = i->second.lock();
-            if (!entry)
-            {
-                i = mesh_lookup.erase(i);
-                continue;
-            }
-            if (entry->key == key)
-            {
-                ++metrics.mesh_cache_hits;
-                return entry;
-            }
-            ++i;
+            ++metrics.mesh_cache_hits;
+            return entry;
         }
         auto m = std::make_shared<Mesh>();
         m->key = key;
+        m->tolerance=tolerance;
         ComPtr<ID2D1Geometry> geometry = o.path->path;
         if (stroke)
         {
@@ -467,15 +523,18 @@ struct StencilRenderer
             check(sink->Close(), L"Stencil intersection completion failed");
             geometry = result;
         }
-        Sink sink(limit, m->vertices);
-        check(geometry->Tessellate(nullptr, tolerance, &sink), L"Stencil tessellation failed");
-        check(sink.Close(), L"Stencil mesh vertex budget exceeded");
+        if(coverage_only)m->geometry = geometry;
+        if(!coverage_only) {
+            Sink sink(limit, m->vertices);
+            check(geometry->Tessellate(nullptr, tolerance, &sink), L"Stencil tessellation failed");
+            check(sink.Close(), L"Stencil mesh vertex budget exceeded");
+        }
         ++metrics.mesh_builds;
         while (!cache.empty() && cache_bytes + m->bytes() > cache_limit)
         {
             cache_bytes -= cache.front()->bytes();
             budget.cache_erase(*cache.front());
-            cache.erase(cache.begin());
+            cache.pop_front();
         }
         if (m->bytes() <= cache_limit)
         {
@@ -483,17 +542,12 @@ struct StencilRenderer
             cache_bytes += m->bytes();
             budget.cache_insert(*m);
             mesh_lookup.emplace(keyhash, m);
-            if (mesh_lookup.size() > 65536)
-            {
-                mesh_lookup.clear();
-                for (auto &entry : cache)
-                    mesh_lookup.emplace(ReplayRenderer::hash(entry->key), entry);
-            }
         }
         return m;
     }
     bool submit(const ag_stencil_snapshot &s, uint32_t w, uint32_t h, float lw, float lh, uint64_t available,
-                bool gpu_paths = false, uint64_t cpu_allowance = cpu_limit)
+                bool gpu_paths = false, uint64_t cpu_allowance = cpu_limit,
+                const CpuFootprint *retained = nullptr, bool vector_coverage=false)
     {
         auto begin = std::chrono::steady_clock::now();
         require(s.size == sizeof(s) && s.version == 1 && s.flags == AG_STENCIL_COMPLETE &&
@@ -579,9 +633,10 @@ struct StencilRenderer
         std::array<State, 17> state{};
         std::array<bool, 17> alive{};
         alive[0] = true;
-        std::set<const Mesh *> used;
+        PointerSet<const Mesh *> used;
+        used.reserve(s.command_count);
         n.operations.reserve(s.command_count);
-        CpuBudget budget(*this, n);
+        CpuBudget budget(*this, n, retained);
         for (uint32_t i = 0; i < s.command_count; ++i)
         {
             auto &c = s.commands[i];
@@ -692,7 +747,7 @@ struct StencilRenderer
             if (gpu_paths || o.kind != AG_STENCIL_REPLAY || o.state.test ||
                 (o.state.tile && o.comparison != AG_REPLAY_CLEAR))
             {
-                o.mesh = mesh(o, n, s.mesh_vertex_limit - uint32_t(n.vertices), budget);
+                o.mesh = mesh(o, n, s.mesh_vertex_limit - uint32_t(n.vertices), budget, vector_coverage && o.kind==AG_STENCIL_REPLAY);
                 if (used.insert(o.mesh.get()).second)
                     n.vertices += o.mesh->vertices.size();
                 require(n.vertices <= s.mesh_vertex_limit, L"Stencil scene vertex budget exceeded",
@@ -703,7 +758,7 @@ struct StencilRenderer
             require(budget.bytes() <= cpu_allowance, L"Stencil CPU replacement budget exceeded",
                     E_OUTOFMEMORY);
         }
-        require(cpu_bytes(&n) <= cpu_allowance, L"Stencil CPU replacement budget exceeded", E_OUTOFMEMORY);
+        require(cpu_bytes(&n, retained) <= cpu_allowance, L"Stencil CPU replacement budget exceeded", E_OUTOFMEMORY);
         const bool changed = scene.key != n.key;
         if (changed)
         {

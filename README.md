@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.6.3 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.8.0 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 
@@ -35,6 +35,7 @@ The shared preparation folder uses the exact empty marker place_norm_and_b612_he
 | Ordered mask-dependent vector paint | Display stencil scenes: two independent byte masks, retained GPU path meshes, opaque paint and complete reset replay |
 | Stateful integer pixel materials | OrderedDisplay: explicit FL11.1/ROV, copied trusted programs/records, retained path coverage, two integer planes and one resolve |
 | Images interleaved with integer materials | OrderedImage and shader contract 2: immutable packed uint images, two point-load inputs, existing ordered masks and coverage |
+| Selectable connected-path rasterization | Ordered or Vector coverage: complete paths, Direct2D antialiasing, reusable coverage pages and ordered material composition; see docs/coverage.md |
 
 Window-backed Displays support installing a graph before their first render. An eligible visible render ensures the HWND swap chain independently of effect-target preparation; no preliminary render or resize workaround is needed. Stable chains are reused. See docs/window-presentation.md in the SDK for first-use, suspension and reset qualification.
 
@@ -47,6 +48,12 @@ Stencil paint also supports an owned opaque4x4 ARGB8 tile for filled and positiv
 Stencil resource/descriptor preparation has a separate16MiB ceiling inside its existing64MiB counted owner budget. Ordinary replay and the shared resource cache keep their3MiB limits; path/mesh/texture limits and the public ABI are unchanged. See the SDK's docs/preparation.md for disconnected-path stress results and the distinction between preparation and rendering.
 
 The application owns simulator protocols, data acquisition, units, coordinate conversion, physical limits, settings meaning and scene geometry. The DLL contains generic mechanisms. Native API comments in include/ass_graphics define coordinates, bounds and ownership.
+
+For editable paragraphs and prompts, `AG_MULTILINE_EDIT` creates a wrapping native
+input with vertical scrolling. Use the existing control C API; Enter/Shift+Enter
+policy remains with the host. `AG_EDIT` and `AG_STATUS` retain their existing
+public contracts. All text controls now use Windows Rich Edit in plain-text mode;
+see [native text controls](docs/native-text.md) and [multiline input](docs/multiline-edit.md).
 
 ## Build native Debug and Release
 

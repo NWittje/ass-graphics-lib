@@ -6,8 +6,19 @@
 #include <charconv>
 #include <shobjidl.h>
 #include <unordered_map>
+#include <richedit.h>
 namespace ag
 {
+const wchar_t *Context::edit_class()
+{
+    ui();
+    if (!rich_edit)
+    {
+        rich_edit = LoadLibraryExW(L"Msftedit.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        wincheck(rich_edit != nullptr, L"System Rich Edit control unavailable");
+    }
+    return MSFTEDIT_CLASS;
+}
 // Use the same invariant representation as from_chars/settings, regardless of
 // the application's C locale (for example a German decimal comma).
 static std::wstring numeric_text(double value, int precision)
@@ -758,20 +769,94 @@ struct Control final : Object
         }
         if (pending != cached)
         {
-            int line = int(SendMessageW(hwnd, EM_GETFIRSTVISIBLELINE, 0, 0));
+            POINT position{};
+            position = text_scroll_position();
             SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
             SetWindowTextW(hwnd, pending.c_str());
             auto count = DWORD(pending.size());
             SendMessageW(hwnd, EM_SETSEL, std::min(a, count), std::min(b, count));
-            int after = int(SendMessageW(hwnd, EM_GETFIRSTVISIBLELINE, 0, 0));
-            SendMessageW(hwnd, EM_LINESCROLL, 0, line - after);
+            SendMessageW(hwnd, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&position));
             SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
             cached.swap(pending);
         }
         state = pending_state;
+        status_color();
         dirty = false;
         KillTimer(hwnd, 1);
         InvalidateRect(hwnd, nullptr, TRUE);
+    }
+    bool text_control() const
+    {
+        return type == AG_EDIT || type == AG_NUMERIC || type == AG_STATUS || type == AG_MULTILINE_EDIT;
+    }
+    POINT text_scroll_position() const
+    {
+        POINT position{};
+        SendMessageW(hwnd, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&position));
+        // EM_GETSCROLLPOS truncates even its LONG fields to 16 bits. Native
+        // scroll-bar positions retain the full range for long live readouts.
+        SCROLLINFO info{sizeof(info), SIF_POS};
+        if (GetScrollInfo(hwnd, SB_HORZ, &info))
+            position.x = info.nPos;
+        if (GetScrollInfo(hwnd, SB_VERT, &info))
+            position.y = info.nPos;
+        return position;
+    }
+    void status_color()
+    {
+        if (type != AG_STATUS)
+            return;
+        const auto &theme = context->theme;
+        const auto c = state == 1   ? theme.warning
+                       : state == 2 ? theme.error
+                       : state == 3 ? theme.success
+                                    : theme.foreground;
+        CHARFORMAT2W format{};
+        format.cbSize = sizeof(format);
+        format.dwMask = CFM_COLOR;
+        format.crTextColor = RGB(BYTE(c.r * 255), BYTE(c.g * 255), BYTE(c.b * 255));
+        // Rich Edit does not use WM_CTLCOLORSTATIC for its read-only text.
+        require(SendMessageW(hwnd, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&format)) != 0,
+                L"Status character color failed", E_FAIL);
+    }
+    void text_alignment(uint32_t flags)
+    {
+        CHARRANGE selection{};
+        const auto position = text_scroll_position();
+        SendMessageW(hwnd, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        CHARRANGE all{0, -1};
+        SendMessageW(hwnd, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&all));
+        PARAFORMAT2 format{};
+        format.cbSize = sizeof(format);
+        format.dwMask = PFM_ALIGNMENT;
+        format.wAlignment = flags & AG_STYLE_ALIGN_RIGHT    ? PFA_RIGHT
+                            : flags & AG_STYLE_ALIGN_CENTER ? PFA_CENTER
+                                                            : PFA_LEFT;
+        // Plain-text mode has one document-wide paragraph format. The native
+        // SPF_SETDEFAULT flag applies that format without changing text mode.
+        const auto applied =
+            SendMessageW(hwnd, EM_SETPARAFORMAT, SPF_SETDEFAULT, reinterpret_cast<LPARAM>(&format));
+        SendMessageW(hwnd, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&selection));
+        SendMessageW(hwnd, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&position));
+        require(applied != 0, L"Text alignment failed", E_FAIL);
+    }
+    std::wstring read_text() const
+    {
+        if (text_control())
+        {
+            GETTEXTLENGTHEX length{GTL_NUMCHARS | GTL_PRECISE | GTL_USECRLF, 1200};
+            const auto count = SendMessageW(hwnd, EM_GETTEXTLENGTHEX, reinterpret_cast<WPARAM>(&length), 0);
+            require(count >= 0 && uint64_t(count) < MAXDWORD / sizeof(wchar_t) - 1,
+                    L"Text exceeds supported buffer size", E_OUTOFMEMORY);
+            std::wstring result(size_t(count) + 1, 0);
+            GETTEXTEX get{DWORD(result.size() * sizeof(wchar_t)), GT_USECRLF, 1200, nullptr, nullptr};
+            result.resize(size_t(SendMessageW(hwnd, EM_GETTEXTEX, reinterpret_cast<WPARAM>(&get),
+                                              reinterpret_cast<LPARAM>(result.data()))));
+            return result;
+        }
+        std::wstring result(size_t(GetWindowTextLengthW(hwnd)) + 1, 0);
+        result.resize(size_t(GetWindowTextW(hwnd, result.data(), int(result.size()))));
+        return result;
     }
     void page_layout()
     {
@@ -980,13 +1065,14 @@ struct Control final : Object
                         p->event(AG_DROPDOWN_CHANGED, p->choice_tracking ? 1 : 0);
                 }
                 else if (n == EN_CHANGE && (p->event_flags & AG_CONTROL_NOTIFY_TEXT) && !p->silent_text &&
-                         (p->type == AG_EDIT || p->type == AG_NUMERIC))
+                         (p->type == AG_EDIT || p->type == AG_NUMERIC || p->type == AG_MULTILINE_EDIT))
                     p->event(AG_TEXT_CHANGED, 0);
                 else if (n == EN_KILLFOCUS)
                 {
                     if (p->type == AG_NUMERIC)
                         p->event(AG_VALUE_CHANGED, p->value());
-                    p->event(AG_FOCUS_LOST, 0);
+                    if (p->type != AG_MULTILINE_EDIT || (p->event_flags & AG_CONTROL_NOTIFY_FOCUS))
+                        p->event(AG_FOCUS_LOST, 0);
                 }
             }
             else if (m == WM_HSCROLL && reinterpret_cast<HWND>(l) == p->hwnd && p->type == AG_SLIDER)
@@ -1002,7 +1088,7 @@ struct Control final : Object
             }
             else if ((m == WM_CTLCOLOREDIT || m == WM_CTLCOLORSTATIC) &&
                      reinterpret_cast<HWND>(l) == p->hwnd &&
-                     (p->type == AG_STATUS || p->type == AG_INDICATOR))
+                     p->type == AG_INDICATOR)
             {
                 auto &t = p->context->theme;
                 auto c = p->state == 1   ? t.warning
@@ -1103,6 +1189,10 @@ struct Control final : Object
                 const auto key = message ? message->wParam : w;
                 if ((!message || message->message == WM_KEYDOWN) && p->navigation(key))
                     return DefSubclassProc(h, m, w, l) | DLGC_WANTMESSAGE;
+                // Keep the control API's ordinary dialog Tab traversal. Rich
+                // Edit otherwise asks dialog managers to insert Tab as text.
+                if (p->text_control() && key == VK_TAB)
+                    return DefSubclassProc(h, m, w, l) & ~(DLGC_WANTTAB | DLGC_WANTMESSAGE);
             }
             if (m == WM_KEYDOWN)
                 if (const auto nav = p->navigation(w))
@@ -1113,7 +1203,7 @@ struct Control final : Object
             if (m == WM_CHAR && (w == VK_TAB || w == VK_RETURN || w == VK_ESCAPE) && p->navigation(w))
                 return 0;
             if (m == WM_KILLFOCUS && (p->event_flags & AG_CONTROL_NOTIFY_FOCUS) && p->type != AG_EDIT &&
-                p->type != AG_NUMERIC)
+                p->type != AG_NUMERIC && p->type != AG_MULTILINE_EDIT)
                 p->event(AG_FOCUS_LOST, 0);
             if (m == WM_MOUSEWHEEL && !(p->type == AG_CHOICE && SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0)) &&
                 route_panel_wheel(h, w, l))
@@ -1306,14 +1396,20 @@ struct Control final : Object
             break;
         case AG_EDIT:
         case AG_NUMERIC:
-            cls = L"EDIT";
+            cls = context->edit_class();
             style |= ES_AUTOHSCROLL | WS_TABSTOP;
             ex = WS_EX_CLIENTEDGE;
             break;
         case AG_STATUS:
-            cls = L"EDIT";
+            cls = context->edit_class();
             style |= ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_HSCROLL | WS_VSCROLL |
                      WS_TABSTOP;
+            ex = WS_EX_CLIENTEDGE;
+            break;
+        case AG_MULTILINE_EDIT:
+            cls = context->edit_class();
+            // Wrap is a creation-time control property, not a key convention.
+            style |= ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL | WS_TABSTOP;
             ex = WS_EX_CLIENTEDGE;
             break;
         case AG_SLIDER:
@@ -1336,10 +1432,25 @@ struct Control final : Object
             throw Failure{E_INVALIDARG, L"Unknown control kind"};
         }
         auto r = pixels(d.bounds, dpi(parent));
-        hwnd = CreateWindowExW(ex, cls, d.text ? d.text : L"", style, r.left, r.top, r.right - r.left,
-                               r.bottom - r.top, parent, reinterpret_cast<HMENU>(UINT_PTR(id)), module(),
-                               nullptr);
+        hwnd = CreateWindowExW(ex, cls,
+                               text_control() ? L""
+                               : d.text       ? d.text
+                                              : L"",
+                               style, r.left, r.top, r.right - r.left, r.bottom - r.top, parent,
+                               reinterpret_cast<HMENU>(UINT_PTR(id)), module(), nullptr);
         wincheck(hwnd != nullptr, L"Control creation failed");
+        if (text_control())
+        {
+            // Set the native plain-text contract before any initial content.
+            require(SendMessageW(hwnd, EM_SETTEXTMODE, TM_PLAINTEXT | TM_MULTICODEPAGE | TM_MULTILEVELUNDO,
+                                 0) == 0,
+                    L"Plain-text control initialization failed", E_FAIL);
+            SendMessageW(hwnd, EM_SETEVENTMASK, 0, ENM_CHANGE);
+            SendMessageW(hwnd, EM_EXLIMITTEXT, 0,
+                         type == AG_STATUS || type == AG_MULTILINE_EDIT ? 1024 * 1024 : 32767);
+            SendMessageW(hwnd, EM_SETBKGNDCOLOR, TRUE, 0);
+            wincheck(SetWindowTextW(hwnd, d.text ? d.text : L""), L"Initial text failed");
+        }
         if (type == AG_PANEL)
             wincheck(SetPropW(hwnd, L"ASS.Graphics.ScrollPanel", this), L"Panel identity unavailable");
         SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(context->font(0, false, dpi(parent))), TRUE);
@@ -1350,8 +1461,7 @@ struct Control final : Object
         // Reuse the later layout rule after B612 supplies native font metrics.
         if (type == AG_CHOICE)
             check(ag_bounds_set(this, layout_bounds), L"Choice initial layout failed");
-        if (type == AG_STATUS)
-            SendMessageW(hwnd, EM_SETLIMITTEXT, 1024 * 1024, 0);
+        status_color();
         if (type == AG_SLIDER)
         {
             unit = d.text ? d.text : L"";
@@ -1760,9 +1870,7 @@ ag_result ag_control_text_get(ag_handle h, wchar_t *text, uint32_t capacity, uin
         {
             auto p = get<Control>(h, Kind::Control);
             p->ui();
-            std::wstring value(size_t(GetWindowTextLengthW(p->hwnd)) + 1, 0);
-            value.resize(size_t(GetWindowTextW(p->hwnd, value.data(), int(value.size()))));
-            copy_text(value, text, capacity, required);
+            copy_text(p->read_text(), text, capacity, required);
         });
 }
 ag_result ag_control_text_extent(ag_handle h, float width_dips, ag_point *size_dips)
@@ -1855,7 +1963,8 @@ ag_result ag_control_events(ag_handle h, uint32_t flags)
                 require(!p->dropdown_open(), L"Cannot change decision mode while open", HRESULT_FROM_WIN32(ERROR_BUSY));
                 p->choice_decision.invalidate();
             }
-            require(!(flags & AG_CONTROL_NOTIFY_TEXT) || p->type == AG_EDIT || p->type == AG_NUMERIC,
+            require(!(flags & AG_CONTROL_NOTIFY_TEXT) || p->type == AG_EDIT || p->type == AG_NUMERIC ||
+                        p->type == AG_MULTILINE_EDIT,
                     L"Text notifications require an edit control");
             require(!(flags & AG_CONTROL_NOTIFY_DROPDOWN) || p->type == AG_CHOICE,
                     L"Dropdown notifications require a choice");
@@ -2391,11 +2500,16 @@ ag_result ag_control_style(ag_handle h, uint32_t flags)
                 style = (style & ~LONG_PTR(SS_TYPEMASK)) | (flags & AG_STYLE_ALIGN_RIGHT    ? SS_RIGHT
                                                             : flags & AG_STYLE_ALIGN_CENTER ? SS_CENTER
                                                                                             : SS_LEFT);
-            else if (p->type == AG_EDIT || p->type == AG_NUMERIC || p->type == AG_STATUS)
+            else if (p->type == AG_EDIT || p->type == AG_NUMERIC || p->type == AG_STATUS ||
+                     p->type == AG_MULTILINE_EDIT)
+            {
+                p->text_alignment(flags);
+
                 style =
                     (style & ~LONG_PTR(ES_CENTER | ES_RIGHT)) | (flags & AG_STYLE_ALIGN_RIGHT    ? ES_RIGHT
                                                                  : flags & AG_STYLE_ALIGN_CENTER ? ES_CENTER
                                                                                                  : ES_LEFT);
+            }
             else
                 require(flags == 0, L"Alignment is not supported for this control kind");
             p->style_flags = flags;

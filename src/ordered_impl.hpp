@@ -1,5 +1,7 @@
 #pragma once
 #include "ass_graphics/ordered.h"
+#include "coverage_impl.hpp"
+#include <span>
 #include "ordered_vs.h"
 #include <d3d11_3.h>
 #include <d3dcompiler.h>
@@ -62,9 +64,9 @@ struct OrderedProgramData
         constexpr UINT64 rov = 0x1000, early = D3D_SHADER_REQUIRES_EARLY_DEPTH_STENCIL;
         const auto flags = r->GetRequiresFlags();
         require(material ? flags == (rov | early) : flags == 0, L"Ordered shader requirements mismatch");
-        require(desc.InputParameters == (material ? 2u : 1u) && desc.OutputParameters == (material ? 0u : 1u),
+        require(desc.InputParameters == (material ? (contract == 3 ? 3u : 2u) : 1u) && desc.OutputParameters == (material ? 0u : 1u),
                 L"Ordered shader signature mismatch");
-        bool position = false, index = false;
+        bool position = false, index = false, coverage = false;
         for (UINT i = 0; i < desc.InputParameters; ++i)
         {
             D3D11_SIGNATURE_PARAMETER_DESC p{};
@@ -76,10 +78,13 @@ struct OrderedProgramData
                      p.SystemValueType == D3D_NAME_UNDEFINED &&
                      p.ComponentType == D3D_REGISTER_COMPONENT_UINT32 && p.Mask == 1)
                 index = true;
+            else if (material && contract == 3 && !_stricmp(p.SemanticName, "TEXCOORD") &&
+                     p.SemanticIndex == 0 && p.ComponentType == D3D_REGISTER_COMPONENT_FLOAT32 && p.Mask == 3)
+                coverage = true;
             else
                 require(false, L"Unexpected ordered shader input");
         }
-        require(position && (!material || index), L"Missing ordered shader input");
+        require(position && (!material || index) && (!material || contract != 3 || coverage), L"Missing ordered shader input");
         if (!material)
         {
             D3D11_SIGNATURE_PARAMETER_DESC p{};
@@ -106,10 +111,13 @@ struct OrderedProgramData
             else if (material && b.Type == D3D_SIT_STRUCTURED && b.BindPoint == 0 &&
                      b.Dimension == D3D_SRV_DIMENSION_BUFFER)
                 bit = 4;
-            else if (material && contract == 2 && b.Type == D3D_SIT_TEXTURE &&
+            else if (material && contract >= 2 && b.Type == D3D_SIT_TEXTURE &&
                      b.BindPoint >= 1 && b.BindPoint <= 2 &&
                      b.Dimension == D3D_SRV_DIMENSION_TEXTURE2D && b.ReturnType == D3D_RETURN_TYPE_UINT)
                 bit = 16u << (b.BindPoint - 1);
+            else if (material && contract == 3 && b.Type == D3D_SIT_TEXTURE && b.BindPoint == 3 &&
+                     b.Dimension == D3D_SRV_DIMENSION_TEXTURE2D && b.ReturnType == D3D_RETURN_TYPE_FLOAT)
+                bit = 64;
             else if (b.Type == (material ? D3D_SIT_UAV_RWTYPED : D3D_SIT_TEXTURE) && b.BindPoint < 2 &&
                      b.Dimension == D3D_SRV_DIMENSION_TEXTURE2D && b.ReturnType == D3D_RETURN_TYPE_UINT)
                 bit = 1u << b.BindPoint;
@@ -117,6 +125,7 @@ struct OrderedProgramData
             bindings |= bit;
         }
         require((bindings & 7) == (material ? 7u : 3u), L"Missing ordered resource binding");
+        require(!material || contract != 3 || (bindings & 64), L"Missing vector coverage binding");
         // A shared constants block may be optimized out of either program.
         return (bindings >> 4) & 3;
     }
@@ -141,6 +150,7 @@ struct OrderedRenderer
     struct Run
     {
         uint32_t operation, first, count;
+        uint32_t page{UINT32_MAX};
     };
     struct Scene
     {
@@ -150,13 +160,14 @@ struct OrderedRenderer
         std::vector<Vertex> vertices;
         std::vector<Run> runs;
         std::vector<ag_ordered_record> records;
-        uint64_t coverage_bytes{};
+        uint64_t coverage_bytes{}, atlas_budget{};
+        std::unique_ptr<CoverageAtlas::Plan> vector_plan;
         uint32_t initial[2]{};
         ComPtr<ID3D11Buffer> vertex_gpu, records_gpu;
         ComPtr<ID3D11ShaderResourceView> records_view;
         uint64_t bytes() const
         {
-            return sizeof(*this) + coverage_bytes + vertices.capacity() * sizeof(Vertex) +
+            return sizeof(*this) + coverage_bytes + (vector_plan ? sizeof(CoverageAtlas::Plan)+vector_plan->bytes() : 0) + vertices.capacity() * sizeof(Vertex) +
                    runs.capacity() * sizeof(Run) + records.capacity() * sizeof(ag_ordered_record);
         }
         void reset()
@@ -173,6 +184,7 @@ struct OrderedRenderer
     std::vector<std::weak_ptr<OrderedImageData>> images;
     std::shared_ptr<Scene> latest, pending, bound;
     StencilRenderer lane;
+    CoverageAtlas atlas;
     uint64_t lane_cpu_bytes;
     ag_ordered_caps caps{sizeof(ag_ordered_caps), 1};
     ag_ordered_state stats{sizeof(ag_ordered_state), 1};
@@ -224,38 +236,45 @@ struct OrderedRenderer
     }
     uint64_t texture_bytes(uint32_t w, uint32_t h) const
     {
-        uint64_t bytes = uint64_t(w) * h * 20;
+        uint64_t bytes = uint64_t(w) * h * 20 + atlas.texture_bytes();
         for (auto &entry : images)
             if (auto image = entry.lock()) bytes += image->texture_bytes();
         return bytes;
     }
-    uint64_t cpu_bytes(const Scene *extra = nullptr) const
+    uint64_t cpu_bytes(const Scene *extra = nullptr, StencilRenderer::CpuFootprint *ownership = nullptr) const
     {
-        uint64_t bytes = sizeof(*this) + programs.capacity() * sizeof(programs[0]) +
+        StencilRenderer::CpuFootprint local;
+        auto &coverage = ownership ? *ownership : local;
+        // The lane object is embedded; its dynamic containers and shared scene
+        // payload are included below with the other coverage owners.
+        uint64_t bytes = sizeof(*this) - sizeof(lane) + atlas.cpu_bytes() + programs.capacity() * sizeof(programs[0]) +
                          images.capacity() * sizeof(images[0]);
-        std::set<const Scene *> scenes;
-        for (auto p : std::array<const Scene *, 4>{latest.get(), pending.get(), bound.get(), extra})
-            if (p)
-                scenes.insert(p);
-        for (auto p : scenes)
-            bytes += p->bytes();
+        const std::array<const Scene *, 4> scenes{latest.get(), pending.get(), bound.get(), extra};
+        for (size_t i = 0; i < scenes.size(); ++i)
+        {
+            auto p = scenes[i];
+            if (!p || std::find(scenes.begin(), scenes.begin() + i, p) != scenes.begin() + i)
+                continue;
+            bytes += p->bytes() - p->coverage_bytes;
+            coverage.include(*p->coverage);
+        }
         for (auto &p : programs)
             if (auto v = p.lock())
                 bytes += v->bytes();
         for (auto &p : images)
-            if (auto v = p.lock()) bytes += v->bytes();
-        // The GPU lane holds another shallow operation/resource list; geometry
-        // lives in the scene above and is deliberately counted conservatively.
-        bytes += lane_cpu_bytes;
+            if (auto v = p.lock())
+                bytes += v->bytes();
+        coverage.include(lane);
+        bytes += coverage.bytes;
         return bytes;
     }
     std::shared_ptr<OrderedProgramData> program(const ag_ordered_program_desc &d)
     {
-        require(d.size == sizeof(d) && d.version == 1 && (d.contract == 1 || d.contract == 2) &&
-                    d.trusted == 1 && d.material &&
-                    d.resolve && d.material_bytes && d.resolve_bytes && d.material_bytes <= 1048576 &&
-                    d.resolve_bytes <= 1048576 && d.constant_bytes <= 4096 && !(d.constant_bytes % 16) &&
-                    (!d.constant_bytes || d.constants) && !d.reserved0 && !d.reserved[0] && !d.reserved[1],
+        require(d.size == sizeof(d) && d.version == 1 && (d.contract >= 1 && d.contract <= 3) &&
+                    d.trusted == 1 && d.material && d.resolve && d.material_bytes && d.resolve_bytes &&
+                    d.material_bytes <= 1048576 && d.resolve_bytes <= 1048576 && d.constant_bytes <= 4096 &&
+                    !(d.constant_bytes % 16) && (!d.constant_bytes || d.constants) && !d.reserved0 &&
+                    !d.reserved[0] && !d.reserved[1],
                 L"Invalid trusted ordered program");
         std::erase_if(programs, [](auto &p) { return p.expired(); });
         require(programs.size() < 16, L"Too many retained ordered programs", E_OUTOFMEMORY);
@@ -306,10 +325,12 @@ struct OrderedRenderer
         images.reserve(16); images.push_back(p); stats.cpu_bytes = cpu_bytes();
         return p;
     }
-    static bool compatible(const StencilRenderer::Operation &a, const StencilRenderer::Operation &b)
+    static bool compatible(const StencilRenderer::Operation &a, const StencilRenderer::Operation &b, bool device_vertices=false)
     {
+        // Coverage quads are already in device coordinates. Their path matrix
+        // is used during coverage generation, not by the quad vertex shader.
         if (a.kind != AG_STENCIL_REPLAY || b.kind != AG_STENCIL_REPLAY ||
-            memcmp(&a.gpu, &b.gpu, sizeof(a.gpu)) || a.state.test != b.state.test)
+            (!device_vertices && memcmp(&a.gpu, &b.gpu, sizeof(a.gpu))) || a.state.test != b.state.test)
             return false;
         if (a.state.test &&
             (a.state.mask != b.state.mask || a.state.bits != b.state.bits ||
@@ -322,15 +343,25 @@ struct OrderedRenderer
     }
     void submit(const ag_ordered_snapshot &s, std::shared_ptr<OrderedProgramData> p, uint32_t w, uint32_t h,
                 float lw, float lh, uint64_t available,
-                std::array<std::shared_ptr<OrderedImageData>, 2> input_images = {})
+                std::array<std::shared_ptr<OrderedImageData>, 2> input_images = {},
+                std::span<const float> outer_widths = {})
     {
         auto admission_start = std::chrono::steady_clock::now();
+        const bool vector_mode = p->contract == 3;
+        if(vector_mode&&!atlas.realized){
+            require(cpu_bytes()+sizeof(CoverageAtlas::RealizationCache)<=StencilRenderer::cpu_limit,
+                    L"Vector geometry cache CPU budget exhausted",E_OUTOFMEMORY);
+            atlas.realized=std::make_unique<CoverageAtlas::RealizationCache>();
+            stats.cpu_bytes=cpu_bytes();
+        }
+        require(outer_widths.empty() || (vector_mode && outer_widths.size() == s.command_count),
+                L"Invalid vector outer widths");
         for (unsigned i = 0; i < 2; ++i)
             require(!(p->image_mask & (1u << i)) || input_images[i], L"Required ordered image slot is empty");
         require(s.size == sizeof(s) && s.version == 1 && s.sequence > requested && s.command_count <= 16383 &&
                     s.resource_count <= 4096 && (!s.command_count || s.commands) &&
                     (!s.resource_count || s.resources) && s.record_count && s.record_count <= 65536 &&
-                    s.records && !(s.flags & ~AG_ORDERED_SEPARATE_PARTS) && !s.reserved[0] && !s.reserved[1],
+                    s.records && !(s.flags & ~(AG_ORDERED_SEPARATE_PARTS|(vector_mode?AG_COVERAGE_BINARY_FILLS:0))) && !s.reserved[0] && !s.reserved[1],
                 L"Invalid ordered snapshot/sequence");
         require(texture_bytes(w, h) <= available, L"Ordered texture budget exceeded", E_OUTOFMEMORY);
         for (uint32_t i = 0; i < s.resource_count; ++i)
@@ -338,8 +369,10 @@ struct OrderedRenderer
                     L"Ordered materials accept path/stroke resources only");
         std::vector<ag_stencil_command> commands;
         std::vector<uint32_t> indices;
+        std::vector<float> widths;
         commands.reserve(s.command_count + 1);
         indices.reserve(s.command_count);
+        widths.reserve(s.command_count);
         ag_stencil_command aa{};
         aa.size = sizeof(aa);
         aa.version = 1;
@@ -351,6 +384,9 @@ struct OrderedRenderer
         for (uint32_t i = 0; i < s.command_count; ++i)
         {
             const auto &c = s.commands[i];
+            const float outer = outer_widths.empty() ? 0 : outer_widths[i];
+            require(finite(outer) && outer >= 0 && (outer == 0 || c.kind == AG_ORDERED_STROKE),
+                    L"Invalid vector outer stroke");
             require(c.size == sizeof(c) && c.version == 1 && !c.reserved[0] && !c.reserved[1],
                     L"Invalid ordered command");
             if (c.kind == AG_ORDERED_STATE)
@@ -368,7 +404,7 @@ struct OrderedRenderer
                 commands.push_back(c.state);
                 if (c.state.kind == AG_STENCIL_CLEAR || c.state.kind == AG_STENCIL_WRITE_FILL ||
                     c.state.kind == AG_STENCIL_WRITE_STROKE)
-                    indices.push_back(UINT32_MAX);
+                    { indices.push_back(UINT32_MAX); widths.push_back(0); }
             }
             else
             {
@@ -384,7 +420,7 @@ struct OrderedRenderer
                 r.replay.context = c.context;
                 r.replay.resource = c.path;
                 commands.push_back(r);
-                indices.push_back(c.record);
+                indices.push_back(c.record); widths.push_back(outer);
             }
         }
         auto next = std::make_shared<Scene>();
@@ -405,12 +441,27 @@ struct OrderedRenderer
                                     s.flattening_tolerance,
                                     s.mesh_vertex_limit,
                                     {0, 0}};
-        const auto held = cpu_bytes();
+        StencilRenderer::CpuFootprint retained;
+        const auto held = cpu_bytes(nullptr, &retained);
         require(held < StencilRenderer::cpu_limit, L"Ordered CPU budget exceeded", E_OUTOFMEMORY);
         next->coverage->submit(stencil, w, h, lw, lh, available - uint64_t(w) * h * 8, true,
-                               StencilRenderer::cpu_limit - held);
-        next->coverage_bytes = next->coverage->cpu_bytes();
+                               StencilRenderer::cpu_limit - held, &retained, vector_mode);
+        // Preserve the standalone footprint for scene diagnostics. Admission
+        // needs its marginal footprint relative to the still-live owners.
+        next->coverage_bytes = next->coverage->metrics.cpu_bytes;
+        const auto additional_coverage = next->coverage->cpu_bytes(nullptr, &retained);
         auto &ops = next->coverage->scene.operations;
+        if(vector_mode) {
+            next->vector_plan=std::make_unique<CoverageAtlas::Plan>(CoverageAtlas::build(
+                context,next->coverage->scene,indices,widths,s.sequence,(s.flags&AG_COVERAGE_BINARY_FILLS)!=0));
+            uint64_t base=uint64_t(w)*h*20;
+            for(auto &image:next->images)if(image)base+=image->texture_bytes();
+            require(base<=available,L"Vector texture budget exhausted",E_OUTOFMEMORY);
+            require(next->vector_plan->vertices.size()<=s.mesh_vertex_limit,L"Vector quad vertex limit exceeded",E_OUTOFMEMORY);
+            next->atlas_budget=available-base;
+            const uint64_t required=uint64_t(next->vector_plan->pages)*next->vector_plan->extent*next->vector_plan->extent*4;
+            require(required<=next->atlas_budget,L"Vector atlas budget exhausted",E_OUTOFMEMORY);
+        }
         require(ops.size() == indices.size(), L"Ordered operation mapping failed", E_UNEXPECTED);
         uint64_t vertices = 0;
         for (auto &o : ops)
@@ -418,41 +469,52 @@ struct OrderedRenderer
                 vertices += o.mesh->vertices.size();
         require(vertices <= s.mesh_vertex_limit && vertices <= 1048576,
                 L"Ordered packed vertex limit exceeded", E_OUTOFMEMORY);
-        require(cpu_bytes(next.get()) + next->coverage_bytes + vertices * sizeof(Vertex) +
-                        uint64_t(s.record_count) * 16 + ops.size() * sizeof(Run) <=
+        // Keep all still-live containers and unique payload. Shared meshes,
+        // resources and immutable index bases add no second ownership charge.
+        const auto candidate_base = held + sizeof(Scene) + additional_coverage;
+        require(candidate_base + vertices * sizeof(Vertex) + uint64_t(s.record_count) * 16 +
+                        ops.size() * sizeof(Run) <=
                     StencilRenderer::cpu_limit,
                 L"Ordered CPU replacement budget exceeded", E_OUTOFMEMORY);
-        next->vertices.reserve(size_t(vertices));
+        if(!vector_mode)next->vertices.reserve(size_t(vertices));
         next->runs.reserve(ops.size());
         next->records.assign(s.records, s.records + s.record_count);
         for (uint32_t i = 0; i < ops.size(); ++i)
         {
             auto &o = ops[i];
             const uint32_t first = uint32_t(next->vertices.size());
-            if (o.kind == AG_STENCIL_REPLAY)
+            if (!vector_mode && o.kind == AG_STENCIL_REPLAY)
                 for (auto v : o.mesh->vertices)
                     next->vertices.push_back({v.x, v.y, indices[i]});
-            const auto count = uint32_t(next->vertices.size()) - first;
-            if (!(s.flags & AG_ORDERED_SEPARATE_PARTS) && !next->runs.empty() &&
-                compatible(ops[next->runs.back().operation], o))
+            auto count = uint32_t(next->vertices.size()) - first;
+            uint32_t actual_first=first,page=UINT32_MAX;
+            if(vector_mode && o.kind==AG_STENCIL_REPLAY) {
+                const auto part=next->vector_plan->operation_part[i];
+                if(part!=UINT32_MAX){const auto &v=next->vector_plan->parts[part];actual_first=v.first;count=6;page=v.page;}
+            }
+            if ((!vector_mode || (!next->runs.empty() && next->runs.back().page==page)) && !(s.flags & AG_ORDERED_SEPARATE_PARTS) && !next->runs.empty() &&
+                compatible(ops[next->runs.back().operation], o,vector_mode))
                 next->runs.back().count += count;
             else
-                next->runs.push_back({i, first, count});
+                next->runs.push_back({i, actual_first, count, page});
         }
         next->initial[0] = s.initial[0];
         next->initial[1] = s.initial[1];
-        require(cpu_bytes(next.get()) + next->coverage_bytes <= StencilRenderer::cpu_limit,
+        require(held + next->bytes() - next->coverage_bytes + additional_coverage <=
+                    StencilRenderer::cpu_limit,
                 L"Ordered retained CPU budget exceeded", E_OUTOFMEMORY);
         latest = std::move(next);
         requested = s.sequence;
         stats.accepted = requested;
         stats.cpu_bytes = cpu_bytes();
-        stats.vertex_bytes = latest->vertices.size() * sizeof(Vertex);
+        stats.vertex_bytes = latest->vector_plan ? latest->vector_plan->vertices.size()*sizeof(CoverageAtlas::Vertex) : latest->vertices.size()*sizeof(Vertex);
+        atlas.metrics.accepted_backend=vector_mode?AG_BACKEND_VECTOR:AG_BACKEND_ORDERED;
         stats.record_bytes = latest->records.size() * 16;
         admission_sequence = s.sequence;
         admission_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - admission_start)
                 .count();
+        atlas.metrics.preparation_ms=admission_ms;
     }
     void reset()
     {
@@ -466,6 +528,7 @@ struct OrderedRenderer
             bound->reset();
         pending.reset();
         bound.reset();
+        atlas.reset();
         lane.clear();
         lane_cpu_bytes = lane.cpu_bytes();
         owner.Reset();
@@ -514,6 +577,7 @@ struct OrderedRenderer
                     E_OUTOFMEMORY);
         }
         stats.resource_creations += lane.metrics.resource_creations - before;
+        if(s->vector_plan)atlas.prepare(d,drawing,*s->vector_plan,s->atlas_budget);
         if (!vertex || !layout || !query)
         {
             // A failed Create* can leave earlier members populated. Admission
@@ -582,13 +646,13 @@ struct OrderedRenderer
                   L"Ordered record view failed");
             stats.resource_creations += 2;
         }
-        if (!s->vertex_gpu && !s->vertices.empty())
+        if (!s->vertex_gpu && (!s->vertices.empty() || (s->vector_plan && !s->vector_plan->vertices.empty())))
         {
             D3D11_BUFFER_DESC b{};
-            b.ByteWidth = UINT(s->vertices.size() * sizeof(Vertex));
+            b.ByteWidth = UINT(s->vector_plan ? s->vector_plan->vertices.size()*sizeof(CoverageAtlas::Vertex) : s->vertices.size()*sizeof(Vertex));
             b.Usage = D3D11_USAGE_IMMUTABLE;
             b.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-            D3D11_SUBRESOURCE_DATA data{s->vertices.data(), 0, 0};
+            D3D11_SUBRESOURCE_DATA data{s->vector_plan ? static_cast<const void*>(s->vector_plan->vertices.data()) : static_cast<const void*>(s->vertices.data()), 0, 0};
             check(d->CreateBuffer(&b, &data, &s->vertex_gpu), L"Ordered packed vertices failed");
             ++stats.resource_creations;
         }
@@ -620,6 +684,7 @@ struct OrderedRenderer
         {
             gpu->CopyResource(destination, lane.colour.Get());
             stats.completed = pending_sequence;
+            atlas.metrics.completed_backend=pending->vector_plan?AG_BACKEND_VECTOR:AG_BACKEND_ORDERED;
             stats.available = 1;
             stats.pending = 0;
             pending.reset();
@@ -680,20 +745,23 @@ struct OrderedRenderer
                     0, nullptr, st.test ? lane.views[st.mask].Get() : nullptr, 0, 2, u, nullptr);
                 gpu->OMSetDepthStencilState(
                     st.test ? lane.states[lane.state_index(o)].Get() : lane.unmasked.Get(), st.reference);
-                gpu->IASetInputLayout(layout.Get());
-                UINT stride = sizeof(Vertex);
+                gpu->IASetInputLayout(s->vector_plan?atlas.layout.Get():layout.Get());
+                UINT stride = s->vector_plan?sizeof(CoverageAtlas::Vertex):sizeof(Vertex);
                 auto vb = s->vertex_gpu.Get();
                 gpu->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
-                gpu->VSSetShader(vertex.Get(), nullptr, 0);
+                gpu->VSSetShader(s->vector_plan?atlas.vertex.Get():vertex.Get(), nullptr, 0);
                 gpu->PSSetShader(s->program->material_gpu.Get(), nullptr, 0);
                 auto view = s->records_view.Get();
                 gpu->PSSetShaderResources(0, 1, &view);
-                if (s->program->contract == 2)
+                if (s->program->contract >= 2)
                 {
                     ID3D11ShaderResourceView *image_views[] = {
                         s->images[0] ? s->images[0]->view.Get() : nullptr,
                         s->images[1] ? s->images[1]->view.Get() : nullptr};
                     gpu->PSSetShaderResources(1, 2, image_views);
+                }
+                if(s->vector_plan) {
+                    auto coverage=atlas.pages[run.page].view.Get();gpu->PSSetShaderResources(3,1,&coverage);
                 }
                 cb = s->program->constants_gpu.Get();
                 gpu->PSSetConstantBuffers(1, 1, &cb);

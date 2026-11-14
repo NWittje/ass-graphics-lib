@@ -117,6 +117,8 @@ Context::~Context()
     write.Reset();
     d2d.Reset();
     wic.Reset();
+    if (rich_edit)
+        FreeLibrary(rich_edit);
     if (com_initialized)
         CoUninitialize();
 }

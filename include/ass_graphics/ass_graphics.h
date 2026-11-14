@@ -116,7 +116,10 @@ extern "C"
         AG_PANEL,
         AG_TABS,
         AG_INDICATOR,
-        AG_CHOICE
+        AG_CHOICE,
+        /* Editable UTF-16 text; wraps at creation, vertical scrolling only.
+           Text/focus notifications are opt-in. Enter policy belongs to the host. */
+        AG_MULTILINE_EDIT = 12
     };
     enum ag_event_kind
     {
