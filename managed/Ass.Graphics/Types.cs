@@ -40,6 +40,17 @@ public struct Camera
     public float FovY, Near, Far;
 }
 [StructLayout(LayoutKind.Sequential)]
+public struct SceneLighting
+{
+    public uint Size, Enabled;
+    public Vector3 SunDirection;
+    public float SunIntensity;
+    public Color SunColor, SkyColor, GroundColor;
+    public float SkyIntensity, GroundIntensity;
+    public Color FogColor;
+    public float FogStart, FogEnd;
+}
+[StructLayout(LayoutKind.Sequential)]
 public struct Vertex
 {
     public Vector3 Position, Normal;

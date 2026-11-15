@@ -1,5 +1,6 @@
 #pragma once
 #include "ass_graphics.h"
+#include "scene_lighting.h"
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -375,6 +376,22 @@ class Chart : public Surface
 class Scene : public Surface
 {
   public:
+    static ag_scene_lighting_options lighting_defaults()
+    {
+        ag_scene_lighting_options value{};
+        check(ag_scene_lighting_defaults(&value));
+        return value;
+    }
+    void lighting(const ag_scene_lighting_options &value)
+    {
+        check(ag_scene_lighting_set(handle(), &value));
+    }
+    ag_scene_lighting_options lighting() const
+    {
+        ag_scene_lighting_options value{};
+        check(ag_scene_lighting_get(handle(), &value));
+        return value;
+    }
     Scene(Context &c, void *parent, ag_rect r, bool warp = false)
     {
         ag_handle h{};

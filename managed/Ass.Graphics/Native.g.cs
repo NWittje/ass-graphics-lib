@@ -155,6 +155,12 @@ public static unsafe class Native {
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_camera(GraphicsHandle scene, Camera* camera);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_lighting_defaults(SceneLighting* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_lighting_set(GraphicsHandle scene, SceneLighting* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_lighting_get(GraphicsHandle scene, SceneLighting* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_options(GraphicsHandle scene, float blur_pixels, uint wireframe);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_overlay(GraphicsHandle scene, Draw* commands, uint count, Point* points, uint point_count);

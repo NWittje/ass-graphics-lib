@@ -1,4 +1,5 @@
 #include "internal.hpp"
+#include <ass_graphics/scene_lighting.h>
 #include "blur_ps.h"
 #include "quad_vs.h"
 #include "scene_ps.h"
@@ -9,10 +10,35 @@
 namespace ag
 {
 using namespace DirectX;
+static ag_scene_lighting_options default_lighting()
+{
+    return {sizeof(ag_scene_lighting_options),
+            0,
+            {.4f, .8f, -.6f},
+            1,
+            {1, 1, 1, 1},
+            {.7f, .8f, 1, 1},
+            {.3f, .25f, .2f, 1},
+            .25f,
+            .1f,
+            {.7f, .8f, .9f, 1},
+            100,
+            1000};
+}
+struct SceneConstants
+{
+    XMFLOAT4X4 matrix;
+    XMFLOAT4 options, sun_direction_enabled, sun, sky, ground, fog, eye_start, fog_range;
+};
+static_assert(sizeof(SceneConstants) == 192);
+static_assert(sizeof(ag_vertex) == 40);
+static_assert(sizeof(ag_scene_lighting_options) == 104);
 struct Scene final : Surface
 {
     bool warp{}, wireframe{}, mesh_dirty{true}, overlay_dirty{true};
     float blur{};
+    // CPU state deliberately survives device reset and target recreation.
+    ag_scene_lighting_options lighting{default_lighting()};
     ag_camera camera{{0, 1.5f, -4}, {0, 0, 0}, {0, 1, 0}, .85f, .01f, 1000};
     std::vector<ag_vertex> vertices;
     std::vector<uint32_t> indices;
@@ -137,7 +163,7 @@ struct Scene final : Surface
         check(device->CreateInputLayout(input, 3, scene_vs, sizeof(scene_vs), &layout),
               L"Vertex layout failed");
         D3D11_BUFFER_DESC cb{};
-        cb.ByteWidth = 80;
+        cb.ByteWidth = sizeof(SceneConstants);
         cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         check(device->CreateBuffer(&cb, nullptr, &constants), L"Constant buffer failed");
         D3D11_RASTERIZER_DESC raster{};
@@ -214,15 +240,21 @@ struct Scene final : Surface
         immediate->OMSetRenderTargets(1, scene_view.GetAddressOf(), depth.Get());
         immediate->OMSetBlendState(blend.Get(), nullptr, 0xffffffff);
         auto load = [](ag_vec3 v) { return XMVectorSet(v.x, v.y, v.z, 0); };
-        struct Constants
-        {
-            XMFLOAT4X4 matrix;
-            XMFLOAT4 options;
-        } cb{};
+        SceneConstants cb{};
         XMStoreFloat4x4(&cb.matrix, XMMatrixLookAtLH(load(camera.eye), load(camera.target), load(camera.up)) *
                                         XMMatrixPerspectiveFovLH(camera.fov_y, float(width) / height,
                                                                  camera.near_z, camera.far_z));
         cb.options = {1.f / width, 1.f / height, blur, 0};
+        const auto &l = lighting;
+        const auto direction = XMVector3Normalize(load(l.sun_direction));
+        XMStoreFloat4(&cb.sun_direction_enabled, direction);
+        cb.sun_direction_enabled.w = float(l.enabled);
+        cb.sun = {l.sun_color.r, l.sun_color.g, l.sun_color.b, l.sun_intensity};
+        cb.sky = {l.sky_color.r, l.sky_color.g, l.sky_color.b, l.sky_intensity};
+        cb.ground = {l.ground_color.r, l.ground_color.g, l.ground_color.b, l.ground_intensity};
+        cb.fog = {l.fog_color.r, l.fog_color.g, l.fog_color.b, 0};
+        cb.eye_start = {camera.eye.x, camera.eye.y, camera.eye.z, l.fog_start};
+        cb.fog_range = {l.fog_end, 0, 0, 0};
         immediate->UpdateSubresource(constants.Get(), 0, nullptr, &cb, 0, 0);
         immediate->VSSetConstantBuffers(0, 1, constants.GetAddressOf());
         immediate->PSSetConstantBuffers(0, 1, constants.GetAddressOf());
@@ -368,6 +400,56 @@ struct Scene final : Surface
 };
 } // namespace ag
 using namespace ag;
+ag_result ag_scene_lighting_defaults(ag_scene_lighting_options *options)
+{
+    return api(
+        [&]
+        {
+            require(options, L"Null lighting options");
+            *options = default_lighting();
+        });
+}
+ag_result ag_scene_lighting_get(ag_handle h, ag_scene_lighting_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(options, L"Null lighting options");
+            *options = p->lighting;
+        });
+}
+ag_result ag_scene_lighting_set(ag_handle h, const ag_scene_lighting_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(options && options->size == sizeof(*options) && options->enabled <= 1,
+                    L"Invalid lighting descriptor");
+            const auto &l = *options;
+            auto range = [](float v, float high) { return finite(v) && v >= 0 && v <= high; };
+            for (auto c : {l.sun_color, l.sky_color, l.ground_color, l.fog_color})
+                require(range(c.r, 1) && range(c.g, 1) && range(c.b, 1) && range(c.a, 1),
+                        L"Invalid lighting color");
+            require(range(l.sun_intensity, 16) && range(l.sky_intensity, 16) && range(l.ground_intensity, 16),
+                    L"Invalid lighting intensity");
+            double length{};
+            for (auto v : {l.sun_direction.x, l.sun_direction.y, l.sun_direction.z})
+            {
+                require(finite(v) && std::abs(v) <= 1e6f, L"Invalid sun direction");
+                length += double(v) * v;
+            }
+            require(length > 1e-12 && range(l.fog_start, 1e12f) && range(l.fog_end, 1e12f) &&
+                        l.fog_end - l.fog_start >= 1e-6f,
+                    L"Invalid sun direction or fog interval");
+            p->lighting = l;
+            std::lock_guard lock(p->mutex);
+            p->schedule_locked();
+        });
+}
 ag_result ag_scene_create(ag_handle c, void *parent, ag_rect r, uint32_t warp, ag_handle *out)
 {
     return api(

@@ -3,21 +3,31 @@ cbuffer SceneConstants : register(b0)
 {
     row_major float4x4 viewProjection;
     float4 options; // inverse width/height, blur radius in pixels, reserved
+    float4 sunDirectionEnabled, sun, sky, ground, fogColor, eyeFogStart, fogRange;
 };
 struct Vertex { float3 position : POSITION; float3 normal : NORMAL; float4 color : COLOR; };
-struct Pixel { float4 position : SV_POSITION; float3 normal : NORMAL; float4 color : COLOR; };
+struct Pixel { float4 position : SV_POSITION; float3 normal : NORMAL; float4 color : COLOR; float3 world : TEXCOORD0; };
 Pixel SceneVS(Vertex v)
 {
     Pixel o;
     o.position = mul(float4(v.position, 1), viewProjection);
     o.normal = v.normal;
     o.color = v.color;
+    o.world = v.position;
     return o;
 }
 float4 ScenePS(Pixel p) : SV_TARGET
 {
     // Zero normals receive ambient light instead of normalize(0) NaNs.
     float3 normal = p.normal * rsqrt(max(dot(p.normal, p.normal), 1e-12));
+    if (sunDirectionEnabled.w != 0) {
+        float hemisphere = saturate(normal.y * .5 + .5);
+        float3 fill = lerp(ground.rgb * ground.w, sky.rgb * sky.w, hemisphere);
+        float3 lit = p.color.rgb * (fill + sun.rgb * sun.w * max(dot(normal, sunDirectionEnabled.xyz), 0));
+        float amount = saturate((distance(p.world, eyeFogStart.xyz) - eyeFogStart.w) /
+                                (fogRange.x - eyeFogStart.w));
+        return float4(lerp(lit, fogColor.rgb, amount), p.color.a);
+    }
     float light = .3 + .7 * abs(dot(normal, normalize(float3(.4, .8, -.6))));
     return float4(p.color.rgb * light, p.color.a);
 }

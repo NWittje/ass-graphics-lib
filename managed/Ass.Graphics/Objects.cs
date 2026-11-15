@@ -286,6 +286,19 @@ public sealed unsafe class Chart : Surface
 /// <summary>UI-thread D3D11 mesh renderer with camera and a shared Direct2D overlay.</summary>
 public sealed unsafe class Scene : Surface
 {
+    public static SceneLighting LightingDefaults()
+    {
+        SceneLighting value;
+        GraphicsError.Check(Native.ag_scene_lighting_defaults(&value));
+        return value;
+    }
+    public void SetLighting(SceneLighting value) => GraphicsError.Check(Native.ag_scene_lighting_set(H, &value));
+    public SceneLighting GetLighting()
+    {
+        SceneLighting value;
+        GraphicsError.Check(Native.ag_scene_lighting_get(H, &value));
+        return value;
+    }
     public Scene(GraphicsContext context, nint parent, Rect bounds, bool warp = false)
     {
         nint h;
