@@ -51,6 +51,18 @@ public struct SceneLighting
     public float FogStart, FogEnd;
 }
 [StructLayout(LayoutKind.Sequential)]
+public struct SceneRadialFog
+{
+    public uint Size, Enabled;
+    public float OriginX, OriginZ, StartRadius, EndRadius;
+    public Color FogColor;
+}
+[StructLayout(LayoutKind.Sequential)]
+public struct SceneSky {
+    public uint Size, Enabled;
+    public Color HorizonColor, ZenithColor;
+}
+[StructLayout(LayoutKind.Sequential)]
 public struct Vertex
 {
     public Vector3 Position, Normal;

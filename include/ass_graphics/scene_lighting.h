@@ -27,6 +27,32 @@ extern "C"
     AG_API ag_result ag_scene_lighting_defaults(ag_scene_lighting_options *options);
     AG_API ag_result ag_scene_lighting_set(ag_handle scene, const ag_scene_lighting_options *options);
     AG_API ag_result ag_scene_lighting_get(ag_handle scene, ag_scene_lighting_options *options);
+    /* Independent opt-in fog override, applied after either lighting path.
+       enabled=0 restores unmodified 1.9 camera-distance/legacy behavior.
+       XZ origin is world-space, height and camera do not affect radius.
+       Origin components finite within +/-1e12; 0 <= start < end <= 1e12,
+       end-start >= 1e-6. Color finite [0,1]; its alpha is ignored.
+       Getter returns defaults (disabled, origin 0, radii 0/100, white) on new
+       Scenes. Set/get require owning UI thread. Settings survive mesh/camera
+       changes and reset; failed validation changes no state. */
+    typedef struct ag_scene_radial_fog_options
+    {
+        uint32_t size, enabled;
+        float origin_x, origin_z, start_radius, end_radius;
+        ag_color fog_color;
+    } ag_scene_radial_fog_options;
+    AG_API ag_result ag_scene_radial_fog_set(ag_handle scene, const ag_scene_radial_fog_options *options);
+    AG_API ag_result ag_scene_radial_fog_get(ag_handle scene, ag_scene_radial_fog_options *options);
+    /* Opt-in procedural world-+Y sky; below-horizon rays use horizon_color.
+       No Context-theme change or texture. Colors finite [0,1], alpha ignored.
+       Set/get UI-thread-only; retained across reset. Disabled by default. */
+    typedef struct ag_scene_sky_options
+    {
+        uint32_t size, enabled;
+        ag_color horizon_color, zenith_color;
+    } ag_scene_sky_options;
+    AG_API ag_result ag_scene_sky_set(ag_handle scene, const ag_scene_sky_options *options);
+    AG_API ag_result ag_scene_sky_get(ag_handle scene, ag_scene_sky_options *options);
 #ifdef __cplusplus
 }
 #endif

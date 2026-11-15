@@ -4,6 +4,7 @@
 #include "quad_vs.h"
 #include "scene_ps.h"
 #include "scene_vs.h"
+#include "sky_ps.h"
 #include <DirectXMath.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -29,8 +30,12 @@ struct SceneConstants
 {
     XMFLOAT4X4 matrix;
     XMFLOAT4 options, sun_direction_enabled, sun, sky, ground, fog, eye_start, fog_range;
+    XMFLOAT4 radial_origin_range, radial_color;
+    XMFLOAT4 sky_horizon, sky_zenith, sky_right, sky_up, sky_forward;
 };
-static_assert(sizeof(SceneConstants) == 192);
+static_assert(sizeof(SceneConstants) == 304);
+static_assert(sizeof(ag_scene_sky_options) == 40);
+static_assert(sizeof(ag_scene_radial_fog_options) == 40);
 static_assert(sizeof(ag_vertex) == 40);
 static_assert(sizeof(ag_scene_lighting_options) == 104);
 struct Scene final : Surface
@@ -39,7 +44,10 @@ struct Scene final : Surface
     float blur{};
     // CPU state deliberately survives device reset and target recreation.
     ag_scene_lighting_options lighting{default_lighting()};
+    ag_scene_radial_fog_options radial_fog{
+        sizeof(ag_scene_radial_fog_options), 0, 0, 0, 0, 100, {1, 1, 1, 1}};
     ag_camera camera{{0, 1.5f, -4}, {0, 0, 0}, {0, 1, 0}, .85f, .01f, 1000};
+    ag_scene_sky_options sky_settings{sizeof(ag_scene_sky_options), 0, {1, 1, 1, 1}, {.25f, .5f, .9f, 1}};
     std::vector<ag_vertex> vertices;
     std::vector<uint32_t> indices;
     Snapshot overlay;
@@ -57,6 +65,7 @@ struct Scene final : Surface
     ComPtr<ID3D11Buffer> vertex_buffer, index_buffer, constants;
     ComPtr<ID3D11VertexShader> vertex_shader, quad_shader;
     ComPtr<ID3D11PixelShader> pixel_shader, blur_shader;
+    ComPtr<ID3D11PixelShader> sky_shader;
     ComPtr<ID3D11InputLayout> layout;
     ComPtr<ID3D11RasterizerState> solid, wire;
     ComPtr<ID3D11SamplerState> sampler;
@@ -154,6 +163,7 @@ struct Scene final : Surface
               L"Quad shader failed");
         check(device->CreatePixelShader(blur_ps, sizeof(blur_ps), nullptr, &blur_shader),
               L"Blur shader failed");
+        check(device->CreatePixelShader(sky_ps, sizeof(sky_ps), nullptr, &sky_shader), L"Sky shader failed");
         D3D11_INPUT_ELEMENT_DESC input[] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
                                              offsetof(ag_vertex, position), D3D11_INPUT_PER_VERTEX_DATA, 0},
                                             {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
@@ -254,10 +264,38 @@ struct Scene final : Surface
         cb.ground = {l.ground_color.r, l.ground_color.g, l.ground_color.b, l.ground_intensity};
         cb.fog = {l.fog_color.r, l.fog_color.g, l.fog_color.b, 0};
         cb.eye_start = {camera.eye.x, camera.eye.y, camera.eye.z, l.fog_start};
-        cb.fog_range = {l.fog_end, 0, 0, 0};
+        cb.fog_range = {l.fog_end, float(radial_fog.enabled), 0, 0};
+        cb.radial_origin_range = {radial_fog.origin_x, radial_fog.origin_z, radial_fog.start_radius,
+                                  radial_fog.end_radius};
+        cb.radial_color = {radial_fog.fog_color.r, radial_fog.fog_color.g, radial_fog.fog_color.b, 0};
+        cb.sky_horizon = {sky_settings.horizon_color.r, sky_settings.horizon_color.g,
+                          sky_settings.horizon_color.b, 1};
+        cb.sky_zenith = {sky_settings.zenith_color.r, sky_settings.zenith_color.g,
+                         sky_settings.zenith_color.b, 1};
+        const auto forward = XMVector3Normalize(XMVectorSubtract(load(camera.target), load(camera.eye)));
+        const auto right = XMVector3Normalize(XMVector3Cross(load(camera.up), forward));
+        const auto up = XMVector3Cross(forward, right);
+        XMStoreFloat4(&cb.sky_forward, forward);
+        XMStoreFloat4(&cb.sky_right, right);
+        XMStoreFloat4(&cb.sky_up, up);
+        cb.sky_up.w = std::tan(camera.fov_y * .5f);
+        cb.sky_right.w = cb.sky_up.w * float(width) / height;
         immediate->UpdateSubresource(constants.Get(), 0, nullptr, &cb, 0, 0);
         immediate->VSSetConstantBuffers(0, 1, constants.GetAddressOf());
         immediate->PSSetConstantBuffers(0, 1, constants.GetAddressOf());
+        if (sky_settings.enabled)
+        {
+            // Detached depth ensures background never occludes the mesh.
+            immediate->OMSetRenderTargets(1, scene_view.GetAddressOf(), nullptr);
+            immediate->RSSetState(solid.Get());
+            immediate->IASetInputLayout(nullptr);
+            immediate->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            immediate->VSSetShader(quad_shader.Get(), nullptr, 0);
+            immediate->PSSetShader(sky_shader.Get(), nullptr, 0);
+            immediate->Draw(3, 0);
+            immediate->OMSetRenderTargets(1, scene_view.GetAddressOf(), depth.Get());
+            immediate->RSSetState(wireframe ? wire.Get() : solid.Get());
+        }
         if (vertex_buffer)
         {
             UINT stride = sizeof(ag_vertex), offset = 0;
@@ -387,6 +425,7 @@ struct Scene final : Surface
         pixel_shader.Reset();
         quad_shader.Reset();
         blur_shader.Reset();
+        sky_shader.Reset();
         solid.Reset();
         wire.Reset();
         sampler.Reset();
@@ -400,6 +439,68 @@ struct Scene final : Surface
 };
 } // namespace ag
 using namespace ag;
+ag_result ag_scene_sky_get(ag_handle h, ag_scene_sky_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(options, L"Null sky options");
+            *options = p->sky_settings;
+        });
+}
+ag_result ag_scene_sky_set(ag_handle h, const ag_scene_sky_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(options && options->size == sizeof(*options) && options->enabled <= 1,
+                    L"Invalid sky descriptor");
+            for (auto color : {options->horizon_color, options->zenith_color})
+                for (auto c : {color.r, color.g, color.b, color.a})
+                    require(finite(c) && c >= 0 && c <= 1, L"Invalid sky color");
+            p->sky_settings = *options;
+            std::lock_guard lock(p->mutex);
+            p->schedule_locked();
+        });
+}
+ag_result ag_scene_radial_fog_get(ag_handle h, ag_scene_radial_fog_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(options, L"Null radial fog options");
+            *options = p->radial_fog;
+        });
+}
+ag_result ag_scene_radial_fog_set(ag_handle h, const ag_scene_radial_fog_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(options && options->size == sizeof(*options) && options->enabled <= 1,
+                    L"Invalid radial fog descriptor");
+            const auto &f = *options;
+            require(finite(f.origin_x) && finite(f.origin_z) && std::abs(f.origin_x) <= 1e12f &&
+                        std::abs(f.origin_z) <= 1e12f,
+                    L"Invalid radial fog origin");
+            require(finite(f.start_radius) && finite(f.end_radius) && f.start_radius >= 0 &&
+                        f.end_radius <= 1e12f && f.end_radius - f.start_radius >= 1e-6f,
+                    L"Invalid radial fog interval");
+            for (auto c : {f.fog_color.r, f.fog_color.g, f.fog_color.b, f.fog_color.a})
+                require(finite(c) && c >= 0 && c <= 1, L"Invalid radial fog color");
+            p->radial_fog = f;
+            std::lock_guard lock(p->mutex);
+            p->schedule_locked();
+        });
+}
 ag_result ag_scene_lighting_defaults(ag_scene_lighting_options *options)
 {
     return api(

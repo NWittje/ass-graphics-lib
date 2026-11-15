@@ -238,6 +238,7 @@ class Control : public Object
     class UpdateScope
     {
         std::shared_ptr<State> state;
+
       public:
         explicit UpdateScope(Control &control) : state(control.state_)
         {
@@ -247,14 +248,21 @@ class Control : public Object
         UpdateScope &operator=(const UpdateScope &) = delete;
         UpdateScope(UpdateScope &&) noexcept = default;
         UpdateScope &operator=(UpdateScope &&) = delete;
-        ~UpdateScope() { if (state) ag_control_update_end(state->handle); }
+        ~UpdateScope()
+        {
+            if (state)
+                ag_control_update_end(state->handle);
+        }
         void finish()
         {
             if (auto owner = std::exchange(state, {}))
                 check(ag_control_update_end(owner->handle));
         }
     };
-    [[nodiscard]] UpdateScope update_scope() { return UpdateScope(*this); }
+    [[nodiscard]] UpdateScope update_scope()
+    {
+        return UpdateScope(*this);
+    }
     void replace(std::span<const wchar_t *const> items, int32_t selected = -1)
     {
         check(ag_choice_replace(handle(), items.data(), uint32_t(items.size()), selected));
@@ -292,7 +300,10 @@ class Control : public Object
         p.own(h, this);
         return p;
     }
-    void equal_width(bool enabled) { check(ag_tab_equal_width(handle(), enabled)); }
+    void equal_width(bool enabled)
+    {
+        check(ag_tab_equal_width(handle(), enabled));
+    }
 };
 class Surface : public Object
 {
@@ -315,8 +326,8 @@ class Path : public Object
     Path(Context &c, std::span<const ag_path_command> commands)
     {
         ag_handle h{};
-        check(ag_path_create(c.handle(),commands.data(),uint32_t(commands.size()),&h));
-        own(h,&c);
+        check(ag_path_create(c.handle(), commands.data(), uint32_t(commands.size()), &h));
+        own(h, &c);
     }
 };
 class Canvas : public Surface
@@ -328,11 +339,17 @@ class Canvas : public Surface
         check(ag_canvas_create(c.handle(), parent, r, &h));
         own(h, &c);
     }
-    void input(ag_canvas_pointer_fn callback,void* user=nullptr){check(ag_canvas_input(handle(),callback,user));}
+    void input(ag_canvas_pointer_fn callback, void *user = nullptr)
+    {
+        check(ag_canvas_input(handle(), callback, user));
+    }
     ag_canvas_render_state render_state() const
     {
-        ag_canvas_render_state state{};state.size=sizeof(state);state.version=1;
-        check(ag_canvas_state(handle(),&state));return state;
+        ag_canvas_render_state state{};
+        state.size = sizeof(state);
+        state.version = 1;
+        check(ag_canvas_state(handle(), &state));
+        return state;
     }
     void submit(std::span<const ag_draw> commands, std::span<const ag_point> points = {})
     {
@@ -342,8 +359,8 @@ class Canvas : public Surface
     void submit_paths(std::span<const ag_draw> commands, std::span<const ag_path_draw> paths,
                       std::span<const ag_point> points = {})
     {
-        check(ag_canvas_submit_paths(handle(),commands.data(),uint32_t(commands.size()),
-              points.data(),uint32_t(points.size()),paths.data(),uint32_t(paths.size())));
+        check(ag_canvas_submit_paths(handle(), commands.data(), uint32_t(commands.size()), points.data(),
+                                     uint32_t(points.size()), paths.data(), uint32_t(paths.size())));
     }
     void png(const wchar_t *file, uint32_t w, uint32_t h, float dpi = 96)
     {
@@ -376,6 +393,26 @@ class Chart : public Surface
 class Scene : public Surface
 {
   public:
+    void sky(const ag_scene_sky_options &value)
+    {
+        check(ag_scene_sky_set(handle(), &value));
+    }
+    ag_scene_sky_options sky() const
+    {
+        ag_scene_sky_options value{};
+        check(ag_scene_sky_get(handle(), &value));
+        return value;
+    }
+    void radial_fog(const ag_scene_radial_fog_options &value)
+    {
+        check(ag_scene_radial_fog_set(handle(), &value));
+    }
+    ag_scene_radial_fog_options radial_fog() const
+    {
+        ag_scene_radial_fog_options value{};
+        check(ag_scene_radial_fog_get(handle(), &value));
+        return value;
+    }
     static ag_scene_lighting_options lighting_defaults()
     {
         ag_scene_lighting_options value{};

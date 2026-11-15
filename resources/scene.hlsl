@@ -4,6 +4,8 @@ cbuffer SceneConstants : register(b0)
     row_major float4x4 viewProjection;
     float4 options; // inverse width/height, blur radius in pixels, reserved
     float4 sunDirectionEnabled, sun, sky, ground, fogColor, eyeFogStart, fogRange;
+    float4 radialOriginRange, radialColor;
+    float4 skyHorizon, skyZenith, skyRight, skyUp, skyForward;
 };
 struct Vertex { float3 position : POSITION; float3 normal : NORMAL; float4 color : COLOR; };
 struct Pixel { float4 position : SV_POSITION; float3 normal : NORMAL; float4 color : COLOR; float3 world : TEXCOORD0; };
@@ -24,11 +26,21 @@ float4 ScenePS(Pixel p) : SV_TARGET
         float hemisphere = saturate(normal.y * .5 + .5);
         float3 fill = lerp(ground.rgb * ground.w, sky.rgb * sky.w, hemisphere);
         float3 lit = p.color.rgb * (fill + sun.rgb * sun.w * max(dot(normal, sunDirectionEnabled.xyz), 0));
+        if (fogRange.y != 0) {
+            float radial = saturate((distance(p.world.xz, radialOriginRange.xy) - radialOriginRange.z) /
+                                    (radialOriginRange.w - radialOriginRange.z));
+            return float4(lerp(lit, radialColor.rgb, radial), p.color.a);
+        }
         float amount = saturate((distance(p.world, eyeFogStart.xyz) - eyeFogStart.w) /
                                 (fogRange.x - eyeFogStart.w));
         return float4(lerp(lit, fogColor.rgb, amount), p.color.a);
     }
     float light = .3 + .7 * abs(dot(normal, normalize(float3(.4, .8, -.6))));
+    if (fogRange.y != 0) {
+        float radial = saturate((distance(p.world.xz, radialOriginRange.xy) - radialOriginRange.z) /
+                                (radialOriginRange.w - radialOriginRange.z));
+        return float4(lerp(p.color.rgb * light, radialColor.rgb, radial), p.color.a);
+    }
     return float4(p.color.rgb * light, p.color.a);
 }
 struct QuadPixel { float4 position : SV_POSITION; float2 uv : TEXCOORD; };
@@ -42,6 +54,12 @@ QuadPixel QuadVS(uint id : SV_VertexID)
     return o;
 }
 Texture2D sceneTexture : register(t0);
+float4 SkyPS(QuadPixel p) : SV_TARGET
+{
+    float3 ray = normalize(skyForward.xyz + skyRight.xyz * ((p.uv.x * 2 - 1) * skyRight.w)
+                           + skyUp.xyz * ((1 - p.uv.y * 2) * skyUp.w));
+    return float4(lerp(skyHorizon.rgb, skyZenith.rgb, saturate(ray.y)), 1);
+}
 SamplerState sceneSampler : register(s0);
 float4 BlurPS(QuadPixel p) : SV_TARGET
 {
