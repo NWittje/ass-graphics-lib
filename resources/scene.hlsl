@@ -7,6 +7,7 @@ cbuffer SceneConstants : register(b0)
     float4 radialOriginRange, radialColor;
     float4 skyHorizon, skyZenith, skyRight, skyUp, skyForward;
     float4 vertexFogColor;
+    float4 waterColor, waterParams;
 };
 struct Vertex { float3 position : POSITION; float3 normal : NORMAL; float4 color : COLOR; };
 struct Pixel { float4 position : SV_POSITION; float3 normal : NORMAL; float4 color : COLOR; float3 world : TEXCOORD0; };
@@ -49,6 +50,14 @@ float4 ScenePS(Pixel p) : SV_TARGET
     return float4(p.color.rgb * light, p.color.a);
 }
 struct QuadPixel { float4 position : SV_POSITION; float2 uv : TEXCOORD; };
+float4 WaterPS(Pixel p) : SV_TARGET
+{
+    float3 delta=eyeFogStart.xyz-p.world;
+    float cosine=saturate(abs(delta.y)*rsqrt(max(dot(delta,delta),1e-12)));
+    float grazing=1-cosine;float squared=grazing*grazing;
+    float alpha=waterColor.w+(1-waterColor.w)*waterParams.x*squared*squared*grazing;
+    return float4(waterColor.rgb,alpha);
+}
 QuadPixel QuadVS(uint id : SV_VertexID)
 {
     // One oversized triangle covers the target without a quad vertex buffer.

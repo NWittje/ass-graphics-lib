@@ -1,10 +1,12 @@
 #include "internal.hpp"
 #include <ass_graphics/scene_lighting.h>
+#include <ass_graphics/scene_translucent.h>
 #include "blur_ps.h"
 #include "quad_vs.h"
 #include "scene_ps.h"
 #include "scene_vs.h"
 #include "sky_ps.h"
+#include "water_ps.h"
 #include <DirectXMath.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -33,17 +35,33 @@ struct SceneConstants
     XMFLOAT4 radial_origin_range, radial_color;
     XMFLOAT4 sky_horizon, sky_zenith, sky_right, sky_up, sky_forward;
     XMFLOAT4 vertex_fog_color;
+    XMFLOAT4 water_color, water_params;
 };
-static_assert(sizeof(SceneConstants) == 320);
+static_assert(sizeof(SceneConstants) == 352);
+static_assert(sizeof(ag_scene_water_options) == 32);
 static_assert(sizeof(ag_scene_vertex_fog_options) == 24);
 static_assert(sizeof(ag_scene_sky_options) == 40);
 static_assert(sizeof(ag_scene_radial_fog_options) == 40);
 static_assert(sizeof(ag_vertex) == 40);
 static_assert(sizeof(ag_scene_lighting_options) == 104);
+// Each bounded slot owns its CPU snapshot and device resources. Only the owning
+// UI thread mutates these; reset discards GPU resources and retains CPU state.
+struct TranslucentLayer
+{
+    ag_scene_translucent_options settings{
+        sizeof(ag_scene_translucent_options), 0, .35f, 0, {.1f, .4f, .6f, 1}};
+    bool dirty{true};
+    std::vector<ag_vertex> vertices, pending_vertices;
+    std::vector<uint32_t> indices, pending_indices;
+    ComPtr<ID3D11Buffer> vertex_buffer, index_buffer;
+};
 struct Scene final : Surface
 {
     bool warp{}, wireframe{}, mesh_dirty{true}, overlay_dirty{true};
     float blur{};
+    std::array<TranslucentLayer, 4> translucent;
+    ComPtr<ID3D11PixelShader> water_shader;
+    ComPtr<ID3D11DepthStencilState> water_depth;
     ag_scene_vertex_fog_options vertex_fog{sizeof(ag_scene_vertex_fog_options), 0, {1, 1, 1, 1}};
     // CPU state deliberately survives device reset and target recreation.
     ag_scene_lighting_options lighting{default_lighting()};
@@ -166,6 +184,13 @@ struct Scene final : Surface
               L"Quad shader failed");
         check(device->CreatePixelShader(blur_ps, sizeof(blur_ps), nullptr, &blur_shader),
               L"Blur shader failed");
+        check(device->CreatePixelShader(water_ps, sizeof(water_ps), nullptr, &water_shader),
+              L"Water shader failed");
+        D3D11_DEPTH_STENCIL_DESC waterDepth{};
+        waterDepth.DepthEnable = TRUE;
+        waterDepth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        waterDepth.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+        check(device->CreateDepthStencilState(&waterDepth, &water_depth), L"Water depth state failed");
         check(device->CreatePixelShader(sky_ps, sizeof(sky_ps), nullptr, &sky_shader), L"Sky shader failed");
         D3D11_INPUT_ELEMENT_DESC input[] = {{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
                                              offsetof(ag_vertex, position), D3D11_INPUT_PER_VERTEX_DATA, 0},
@@ -202,6 +227,8 @@ struct Scene final : Surface
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         check(device->CreateBlendState(&bd, &blend), L"Blend state failed");
         mesh_dirty = true;
+        for (auto &layer : translucent)
+            layer.dirty = true;
     }
     void paint() override
     {
@@ -244,6 +271,25 @@ struct Scene final : Surface
             mesh_dirty = false;
         }
         auto c = context->theme.background;
+        for (auto &layer : translucent)
+            if (layer.dirty)
+            {
+                layer.vertex_buffer.Reset();
+                layer.index_buffer.Reset();
+                if (!layer.vertices.empty() && !layer.indices.empty())
+                {
+                    D3D11_BUFFER_DESC desc{};
+                    desc.ByteWidth = UINT(layer.vertices.size() * sizeof(ag_vertex));
+                    desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+                    D3D11_SUBRESOURCE_DATA data{layer.vertices.data(), 0, 0};
+                    check(device->CreateBuffer(&desc, &data, &layer.vertex_buffer), L"Water vertices failed");
+                    desc.ByteWidth = UINT(layer.indices.size() * sizeof(uint32_t));
+                    desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+                    data.pSysMem = layer.indices.data();
+                    check(device->CreateBuffer(&desc, &data, &layer.index_buffer), L"Water indices failed");
+                }
+                layer.dirty = false;
+            }
         float clear[] = {c.r, c.g, c.b, c.a};
         immediate->ClearRenderTargetView(scene_view.Get(), clear);
         immediate->ClearDepthStencilView(depth.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1, 0);
@@ -313,6 +359,29 @@ struct Scene final : Surface
             immediate->DrawIndexed(UINT(indices.size()), 0, 0);
         }
         immediate->OMSetRenderTargets(1, back_view.GetAddressOf(), nullptr);
+        // Slots render in caller-selected order; they read terrain depth without writing it.
+        // The separate shader ignores vertex alpha, including terrain's fog weights.
+        for (auto &layer : translucent)
+            if (layer.settings.enabled && layer.vertex_buffer)
+            {
+                cb.water_color = {layer.settings.color.r, layer.settings.color.g, layer.settings.color.b,
+                                  layer.settings.opacity};
+                cb.water_params = {layer.settings.fresnel_strength, 0, 0, 0};
+                immediate->UpdateSubresource(constants.Get(), 0, nullptr, &cb, 0, 0);
+                immediate->OMSetRenderTargets(1, scene_view.GetAddressOf(), depth.Get());
+                immediate->OMSetDepthStencilState(water_depth.Get(), 0);
+                immediate->RSSetState(solid.Get());
+                UINT stride = sizeof(ag_vertex), offset = 0;
+                immediate->IASetVertexBuffers(0, 1, layer.vertex_buffer.GetAddressOf(), &stride, &offset);
+                immediate->IASetIndexBuffer(layer.index_buffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+                immediate->IASetInputLayout(layout.Get());
+                immediate->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                immediate->VSSetShader(vertex_shader.Get(), nullptr, 0);
+                immediate->PSSetShader(water_shader.Get(), nullptr, 0);
+                immediate->DrawIndexed(UINT(layer.indices.size()), 0, 0);
+                immediate->OMSetDepthStencilState(nullptr, 0);
+                immediate->OMSetRenderTargets(1, back_view.GetAddressOf(), nullptr);
+            }
         immediate->OMSetBlendState(nullptr, nullptr, 0xffffffff);
         immediate->RSSetState(solid.Get());
         immediate->IASetInputLayout(nullptr);
@@ -431,6 +500,14 @@ struct Scene final : Surface
         quad_shader.Reset();
         blur_shader.Reset();
         sky_shader.Reset();
+        water_shader.Reset();
+        water_depth.Reset();
+        for (auto &layer : translucent)
+        {
+            layer.vertex_buffer.Reset();
+            layer.index_buffer.Reset();
+            layer.dirty = true;
+        }
         solid.Reset();
         wire.Reset();
         sampler.Reset();
@@ -444,6 +521,95 @@ struct Scene final : Surface
 };
 } // namespace ag
 using namespace ag;
+ag_result ag_scene_translucent_get(ag_handle h, uint32_t layer, ag_scene_translucent_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(layer < p->translucent.size(), L"Invalid translucent layer");
+            auto &slot = p->translucent[layer];
+            require(options, L"Null water options");
+            *options = slot.settings;
+        });
+}
+ag_result ag_scene_translucent_set(ag_handle h, uint32_t layer, const ag_scene_translucent_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(layer < p->translucent.size(), L"Invalid translucent layer");
+            auto &slot = p->translucent[layer];
+            require(options && options->size == sizeof(*options) && options->enabled <= 1,
+                    L"Invalid water descriptor");
+            for (auto v : {options->opacity, options->fresnel_strength, options->color.r, options->color.g,
+                           options->color.b, options->color.a})
+                require(finite(v) && v >= 0 && v <= 1, L"Invalid water value");
+            slot.settings = *options;
+            std::lock_guard lock(p->mutex);
+            p->schedule_locked();
+        });
+}
+ag_result ag_scene_translucent_mesh(ag_handle h, uint32_t layer, const ag_vertex *v, uint32_t n,
+                                    const uint32_t *indices, uint32_t count)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(layer < p->translucent.size(), L"Invalid translucent layer");
+            auto &slot = p->translucent[layer];
+            require(n <= 262144 && count <= 786432 && count % 3 == 0 && (!n || v) && (!count || indices),
+                    L"Invalid water mesh size");
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                const auto &a = v[i];
+                for (auto value : {a.position.x, a.position.y, a.position.z, a.normal.x, a.normal.y,
+                                   a.normal.z, a.color.r, a.color.g, a.color.b, a.color.a})
+                    require(finite(value), L"Nonfinite water vertex");
+            }
+            for (uint32_t i = 0; i < count; ++i)
+                require(indices[i] < n, L"Water index out of range");
+            if (n)
+                slot.pending_vertices.assign(v, v + n);
+            else
+                slot.pending_vertices.clear();
+            if (count)
+                slot.pending_indices.assign(indices, indices + count);
+            else
+                slot.pending_indices.clear();
+            slot.vertices.swap(slot.pending_vertices);
+            slot.indices.swap(slot.pending_indices);
+            slot.dirty = true;
+            std::lock_guard lock(p->mutex);
+            p->schedule_locked();
+        });
+}
+ag_result ag_scene_translucent_clear(ag_handle h, uint32_t layer)
+{
+    return ag_scene_translucent_mesh(h, layer, nullptr, 0, nullptr, 0);
+}
+ag_result ag_scene_water_get(ag_handle h, ag_scene_water_options *options)
+{
+    return ag_scene_translucent_get(h, 0, options);
+}
+ag_result ag_scene_water_set(ag_handle h, const ag_scene_water_options *options)
+{
+    return ag_scene_translucent_set(h, 0, options);
+}
+ag_result ag_scene_water_mesh(ag_handle h, const ag_vertex *v, uint32_t n, const uint32_t *indices,
+                              uint32_t count)
+{
+    return ag_scene_translucent_mesh(h, 0, v, n, indices, count);
+}
+ag_result ag_scene_water_clear(ag_handle h)
+{
+    return ag_scene_translucent_clear(h, 0);
+}
 ag_result ag_scene_vertex_fog_get(ag_handle h, ag_scene_vertex_fog_options *options)
 {
     return api(

@@ -1,6 +1,7 @@
 #pragma once
 #include "ass_graphics.h"
 #include "scene_lighting.h"
+#include "scene_translucent.h"
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -393,6 +394,45 @@ class Chart : public Surface
 class Scene : public Surface
 {
   public:
+    void translucent(uint32_t layer, const ag_scene_translucent_options &value)
+    {
+        check(ag_scene_translucent_set(handle(), layer, &value));
+    }
+    ag_scene_translucent_options translucent(uint32_t layer) const
+    {
+        ag_scene_translucent_options value{};
+        check(ag_scene_translucent_get(handle(), layer, &value));
+        return value;
+    }
+    void translucent_mesh(uint32_t layer, std::span<const ag_vertex> v, std::span<const uint32_t> i)
+    {
+        if (v.size() > 262144 || i.size() > 786432)
+            throw std::length_error("Translucent mesh exceeds slot limit");
+        check(ag_scene_translucent_mesh(handle(), layer, v.data(), uint32_t(v.size()), i.data(),
+                                        uint32_t(i.size())));
+    }
+    void translucent_clear(uint32_t layer)
+    {
+        check(ag_scene_translucent_clear(handle(), layer));
+    }
+    void water(const ag_scene_water_options &value)
+    {
+        check(ag_scene_water_set(handle(), &value));
+    }
+    ag_scene_water_options water() const
+    {
+        ag_scene_water_options v{};
+        check(ag_scene_water_get(handle(), &v));
+        return v;
+    }
+    void water_mesh(std::span<const ag_vertex> v, std::span<const uint32_t> i)
+    {
+        translucent_mesh(0, v, i);
+    }
+    void water_clear()
+    {
+        check(ag_scene_water_clear(handle()));
+    }
     void vertex_fog(const ag_scene_vertex_fog_options &value)
     {
         check(ag_scene_vertex_fog_set(handle(), &value));

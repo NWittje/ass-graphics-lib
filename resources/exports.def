@@ -150,3 +150,11 @@ EXPORTS
     ag_scene_sky_set @148
     ag_scene_vertex_fog_get @149
     ag_scene_vertex_fog_set @150
+    ag_scene_water_clear @151
+    ag_scene_water_get @152
+    ag_scene_water_mesh @153
+    ag_scene_water_set @154
+    ag_scene_translucent_clear @155
+    ag_scene_translucent_get @156
+    ag_scene_translucent_mesh @157
+    ag_scene_translucent_set @158

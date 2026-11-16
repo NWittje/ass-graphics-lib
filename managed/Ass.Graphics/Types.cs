@@ -62,6 +62,13 @@ public struct SceneVertexFog {
     public uint Size, Enabled;
     public Color FogColor;
 }
+/// <summary>Fixed translucent material for water or slots 0..3. Disable horizontal Fresnel for vertical walls.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct SceneWater {
+    public uint Size, Enabled;
+    public float Opacity, FresnelStrength;
+    public Color Color;
+}
 [StructLayout(LayoutKind.Sequential)]
 public struct SceneSky {
     public uint Size, Enabled;

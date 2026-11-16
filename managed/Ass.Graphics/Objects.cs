@@ -286,6 +286,19 @@ public sealed unsafe class Chart : Surface
 /// <summary>UI-thread D3D11 mesh renderer with camera and a shared Direct2D overlay.</summary>
 public sealed unsafe class Scene : Surface
 {
+    /// <summary>Get material for translucent slot 0..3. Water uses slot 0.</summary>
+    public SceneWater GetTranslucent(uint layer) { SceneWater value;GraphicsError.Check(Native.ag_scene_translucent_get(H,layer,&value));return value; }
+    public void SetTranslucent(uint layer, SceneWater value) => GraphicsError.Check(Native.ag_scene_translucent_set(H,layer,&value));
+    public void ClearTranslucent(uint layer) => GraphicsError.Check(Native.ag_scene_translucent_clear(H,layer));
+    public void TranslucentMesh(uint layer, ReadOnlySpan<Vertex> vertices, ReadOnlySpan<uint> indices) {
+        fixed(Vertex* v=vertices) fixed(uint* i=indices) GraphicsError.Check(Native.ag_scene_translucent_mesh(H,layer,v,(uint)vertices.Length,i,(uint)indices.Length));
+    }
+    public SceneWater GetWater() { SceneWater value;GraphicsError.Check(Native.ag_scene_water_get(H,&value));return value; }
+    public void SetWater(SceneWater value) => GraphicsError.Check(Native.ag_scene_water_set(H,&value));
+    public void ClearWater() => GraphicsError.Check(Native.ag_scene_water_clear(H));
+    public void WaterMesh(ReadOnlySpan<Vertex> vertices, ReadOnlySpan<uint> indices) {
+        fixed(Vertex* v=vertices) fixed(uint* i=indices) GraphicsError.Check(Native.ag_scene_water_mesh(H,v,(uint)vertices.Length,i,(uint)indices.Length));
+    }
     public void SetVertexFog(SceneVertexFog value) => GraphicsError.Check(Native.ag_scene_vertex_fog_set(H, &value));
     public SceneVertexFog GetVertexFog() { SceneVertexFog value;GraphicsError.Check(Native.ag_scene_vertex_fog_get(H, &value));return value; }
     public void SetSky(SceneSky value) => GraphicsError.Check(Native.ag_scene_sky_set(H, &value));

@@ -173,6 +173,14 @@ public static unsafe class Native {
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_vertex_fog_get(GraphicsHandle scene, SceneVertexFog* options);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_water_get(GraphicsHandle scene, SceneWater* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_water_set(GraphicsHandle scene, SceneWater* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_water_mesh(GraphicsHandle scene, Vertex* vertices, uint vertexCount, uint* indices, uint indexCount);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_water_clear(GraphicsHandle scene);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_options(GraphicsHandle scene, float blur_pixels, uint wireframe);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_overlay(GraphicsHandle scene, Draw* commands, uint count, Point* points, uint point_count);
@@ -266,4 +274,12 @@ public static unsafe class Native {
  public static extern int ag_window_placement_set(GraphicsHandle window, WindowPlacement* placement);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_window_borderless(GraphicsHandle window, uint enabled, char* monitor);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_translucent_get(GraphicsHandle scene, uint layer, SceneWater* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_translucent_set(GraphicsHandle scene, uint layer, SceneWater* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_translucent_mesh(GraphicsHandle scene, uint layer, Vertex* vertices, uint count, uint* indices, uint indexCount);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_translucent_clear(GraphicsHandle scene, uint layer);
 }
