@@ -148,3 +148,5 @@ EXPORTS
     ag_scene_radial_fog_set @146
     ag_scene_sky_get @147
     ag_scene_sky_set @148
+    ag_scene_vertex_fog_get @149
+    ag_scene_vertex_fog_set @150

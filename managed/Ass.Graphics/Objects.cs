@@ -286,6 +286,8 @@ public sealed unsafe class Chart : Surface
 /// <summary>UI-thread D3D11 mesh renderer with camera and a shared Direct2D overlay.</summary>
 public sealed unsafe class Scene : Surface
 {
+    public void SetVertexFog(SceneVertexFog value) => GraphicsError.Check(Native.ag_scene_vertex_fog_set(H, &value));
+    public SceneVertexFog GetVertexFog() { SceneVertexFog value;GraphicsError.Check(Native.ag_scene_vertex_fog_get(H, &value));return value; }
     public void SetSky(SceneSky value) => GraphicsError.Check(Native.ag_scene_sky_set(H, &value));
     public SceneSky GetSky() { SceneSky value;GraphicsError.Check(Native.ag_scene_sky_get(H, &value));return value; }
     public void SetRadialFog(SceneRadialFog value) => GraphicsError.Check(Native.ag_scene_radial_fog_set(H, &value));

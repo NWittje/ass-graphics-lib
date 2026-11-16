@@ -32,8 +32,10 @@ struct SceneConstants
     XMFLOAT4 options, sun_direction_enabled, sun, sky, ground, fog, eye_start, fog_range;
     XMFLOAT4 radial_origin_range, radial_color;
     XMFLOAT4 sky_horizon, sky_zenith, sky_right, sky_up, sky_forward;
+    XMFLOAT4 vertex_fog_color;
 };
-static_assert(sizeof(SceneConstants) == 304);
+static_assert(sizeof(SceneConstants) == 320);
+static_assert(sizeof(ag_scene_vertex_fog_options) == 24);
 static_assert(sizeof(ag_scene_sky_options) == 40);
 static_assert(sizeof(ag_scene_radial_fog_options) == 40);
 static_assert(sizeof(ag_vertex) == 40);
@@ -42,6 +44,7 @@ struct Scene final : Surface
 {
     bool warp{}, wireframe{}, mesh_dirty{true}, overlay_dirty{true};
     float blur{};
+    ag_scene_vertex_fog_options vertex_fog{sizeof(ag_scene_vertex_fog_options), 0, {1, 1, 1, 1}};
     // CPU state deliberately survives device reset and target recreation.
     ag_scene_lighting_options lighting{default_lighting()};
     ag_scene_radial_fog_options radial_fog{
@@ -265,6 +268,8 @@ struct Scene final : Surface
         cb.fog = {l.fog_color.r, l.fog_color.g, l.fog_color.b, 0};
         cb.eye_start = {camera.eye.x, camera.eye.y, camera.eye.z, l.fog_start};
         cb.fog_range = {l.fog_end, float(radial_fog.enabled), 0, 0};
+        cb.vertex_fog_color = {vertex_fog.fog_color.r, vertex_fog.fog_color.g, vertex_fog.fog_color.b,
+                               float(vertex_fog.enabled)};
         cb.radial_origin_range = {radial_fog.origin_x, radial_fog.origin_z, radial_fog.start_radius,
                                   radial_fog.end_radius};
         cb.radial_color = {radial_fog.fog_color.r, radial_fog.fog_color.g, radial_fog.fog_color.b, 0};
@@ -439,6 +444,37 @@ struct Scene final : Surface
 };
 } // namespace ag
 using namespace ag;
+ag_result ag_scene_vertex_fog_get(ag_handle h, ag_scene_vertex_fog_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(options, L"Null vertex fog options");
+            *options = p->vertex_fog;
+        });
+}
+ag_result ag_scene_vertex_fog_set(ag_handle h, const ag_scene_vertex_fog_options *options)
+{
+    return api(
+        [&]
+        {
+            auto p = get<Scene>(h, Kind::Scene);
+            p->ui();
+            require(options && options->size == sizeof(*options) && options->enabled <= 1,
+                    L"Invalid vertex fog descriptor");
+            for (auto c :
+                 {options->fog_color.r, options->fog_color.g, options->fog_color.b, options->fog_color.a})
+                require(finite(c) && c >= 0 && c <= 1, L"Invalid vertex fog color");
+            if (options->enabled)
+                for (const auto &v : p->vertices)
+                    require(v.color.a >= 0 && v.color.a <= 1, L"Vertex fog weight outside [0,1]");
+            p->vertex_fog = *options;
+            std::lock_guard lock(p->mutex);
+            p->schedule_locked();
+        });
+}
 ag_result ag_scene_sky_get(ag_handle h, ag_scene_sky_options *options)
 {
     return api(
@@ -580,6 +616,8 @@ ag_result ag_scene_mesh(ag_handle h, const ag_vertex *v, uint32_t n, const uint3
                             finite(a.normal.x) && finite(a.normal.y) && finite(a.normal.z) &&
                             finite(a.color.r) && finite(a.color.g) && finite(a.color.b) && finite(a.color.a),
                         L"Nonfinite mesh vertex");
+                require(!p->vertex_fog.enabled || (a.color.a >= 0 && a.color.a <= 1),
+                        L"Vertex fog weight outside [0,1]");
             }
             for (uint32_t i = 0; i < count; ++i)
                 require(indices[i] < n, L"Mesh index out of range");

@@ -6,6 +6,7 @@ cbuffer SceneConstants : register(b0)
     float4 sunDirectionEnabled, sun, sky, ground, fogColor, eyeFogStart, fogRange;
     float4 radialOriginRange, radialColor;
     float4 skyHorizon, skyZenith, skyRight, skyUp, skyForward;
+    float4 vertexFogColor;
 };
 struct Vertex { float3 position : POSITION; float3 normal : NORMAL; float4 color : COLOR; };
 struct Pixel { float4 position : SV_POSITION; float3 normal : NORMAL; float4 color : COLOR; float3 world : TEXCOORD0; };
@@ -26,6 +27,8 @@ float4 ScenePS(Pixel p) : SV_TARGET
         float hemisphere = saturate(normal.y * .5 + .5);
         float3 fill = lerp(ground.rgb * ground.w, sky.rgb * sky.w, hemisphere);
         float3 lit = p.color.rgb * (fill + sun.rgb * sun.w * max(dot(normal, sunDirectionEnabled.xyz), 0));
+        if (vertexFogColor.w != 0)
+            return float4(lerp(lit, vertexFogColor.rgb, saturate(p.color.a)), 1);
         if (fogRange.y != 0) {
             float radial = saturate((distance(p.world.xz, radialOriginRange.xy) - radialOriginRange.z) /
                                     (radialOriginRange.w - radialOriginRange.z));
@@ -36,6 +39,8 @@ float4 ScenePS(Pixel p) : SV_TARGET
         return float4(lerp(lit, fogColor.rgb, amount), p.color.a);
     }
     float light = .3 + .7 * abs(dot(normal, normalize(float3(.4, .8, -.6))));
+    if (vertexFogColor.w != 0)
+        return float4(lerp(p.color.rgb * light, vertexFogColor.rgb, saturate(p.color.a)), 1);
     if (fogRange.y != 0) {
         float radial = saturate((distance(p.world.xz, radialOriginRange.xy) - radialOriginRange.z) /
                                 (radialOriginRange.w - radialOriginRange.z));

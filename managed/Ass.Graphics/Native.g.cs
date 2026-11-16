@@ -169,6 +169,10 @@ public static unsafe class Native {
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_sky_get(GraphicsHandle scene, SceneSky* options);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_vertex_fog_set(GraphicsHandle scene, SceneVertexFog* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
+ public static extern int ag_scene_vertex_fog_get(GraphicsHandle scene, SceneVertexFog* options);
+ [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_options(GraphicsHandle scene, float blur_pixels, uint wireframe);
  [DllImport("ass_graphics_lib", ExactSpelling=true, CallingConvention=CallingConvention.Cdecl)]
  public static extern int ag_scene_overlay(GraphicsHandle scene, Draw* commands, uint count, Point* points, uint point_count);

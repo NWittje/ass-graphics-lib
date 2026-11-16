@@ -58,6 +58,11 @@ public struct SceneRadialFog
     public Color FogColor;
 }
 [StructLayout(LayoutKind.Sequential)]
+public struct SceneVertexFog {
+    public uint Size, Enabled;
+    public Color FogColor;
+}
+[StructLayout(LayoutKind.Sequential)]
 public struct SceneSky {
     public uint Size, Enabled;
     public Color HorizonColor, ZenithColor;

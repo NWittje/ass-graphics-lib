@@ -393,6 +393,16 @@ class Chart : public Surface
 class Scene : public Surface
 {
   public:
+    void vertex_fog(const ag_scene_vertex_fog_options &value)
+    {
+        check(ag_scene_vertex_fog_set(handle(), &value));
+    }
+    ag_scene_vertex_fog_options vertex_fog() const
+    {
+        ag_scene_vertex_fog_options value{};
+        check(ag_scene_vertex_fog_get(handle(), &value));
+        return value;
+    }
     void sky(const ag_scene_sky_options &value)
     {
         check(ag_scene_sky_set(handle(), &value));

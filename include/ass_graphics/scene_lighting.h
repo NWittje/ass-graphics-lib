@@ -53,6 +53,19 @@ extern "C"
     } ag_scene_sky_options;
     AG_API ag_result ag_scene_sky_set(ag_handle scene, const ag_scene_sky_options *options);
     AG_API ag_result ag_scene_sky_get(ag_handle scene, ag_scene_sky_options *options);
+    /* Explicit opt-in alpha reinterpretation: color.a becomes interpolated
+       fog weight [0,1], with opaque output. Overrides other fog AFTER lighting.
+       Disabled retains all existing alpha/fog semantics. Current/subsequent
+       mesh weights must be[0,1] while enabled. Size24; enabled0/1; finite color
+       channels[0,1], alpha ignored. UI-thread get/set; retained across reset.
+       Invalid requests leave state unchanged. */
+    typedef struct ag_scene_vertex_fog_options
+    {
+        uint32_t size, enabled;
+        ag_color fog_color;
+    } ag_scene_vertex_fog_options;
+    AG_API ag_result ag_scene_vertex_fog_set(ag_handle scene, const ag_scene_vertex_fog_options *options);
+    AG_API ag_result ag_scene_vertex_fog_get(ag_handle scene, ag_scene_vertex_fog_options *options);
 #ifdef __cplusplus
 }
 #endif

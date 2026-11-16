@@ -1,6 +1,6 @@
 # ASS Graphics
 
-Windows x64 graphics/UI library, C++20, version 1.10.0 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
+Windows x64 graphics/UI library, C++20, version 1.11.0 / C ABI 1. Build one native runtime DLL containing the UI/rendering modules, compiled shaders and static C/C++ runtime. B612 Regular/Bold is an external dependency. Optional .NET 10 Windows/WinForms bindings use the same native renderer.
 
 This repository contains implementation source, public headers, shader/resource inputs, external-font notices/licenses, build definitions and source examples. Compiled SDKs, binaries, tests, testing tools, logs, local automation and investigation records are intentionally excluded.
 
@@ -133,6 +133,8 @@ Version 1.6.1 also adds sample-correlated display timing through timing.h / timi
 
 Version 1.6.3 adds ordered_images.h / ordered_images.hpp and OrderedImages.cs. Create immutable R32_UINT image handles outside the frame loop, create a trusted contract 2 program using ordered_images_contract.hlsl, and submit with two explicit image slots. Existing FILL/STROKE coverage, clipping, masks, integer planes and draw ordering apply to image samples. The caller defines source coordinates, bounds treatment and packed-channel arithmetic. No per-pixel path expansion, automatic decoding or per-frame image upload is performed. Accepted/pending scenes retain image data after handles are released; device reset reconstructs from the copied pixels. Contract 1, its public headers and previous SDKs remain available. See docs/ordered-images.md in the SDK for limits, ownership, examples and measurement scope.
 
-Scene 1.10.0 adds opt-in directional sunlight, hemispheric fill and camera-distance fog; see the SDK's docs/scene-lighting.md. Existing rendering stays on its legacy path unless enabled. C, C++ and managed source bindings share the same native renderer.
+Scene 1.11.0 adds opt-in directional sunlight, hemispheric fill and camera-distance fog; see the SDK's docs/scene-lighting.md. Existing rendering stays on its legacy path unless enabled. C, C++ and managed source bindings share the same native renderer.
 
-Scene 1.10.0 also adds independent world-XZ radial fog and a world-up procedural sky gradient. Both are disabled by default. See the SDK's docs/scene-environment.md; terrain data, roughness coloring and gradient normals remain caller-owned.
+Scene 1.11.0 also adds independent world-XZ radial fog and a world-up procedural sky gradient. Both are disabled by default. See the SDK's docs/scene-environment.md; terrain data, roughness coloring and gradient normals remain caller-owned.
+
+Scene 1.11.0 adds opt-in vertex fog: alpha carries an interpolated fog amount and output becomes opaque only in that mode. This supports deformed surfaces without another vertex stream. See SDK docs/scene-vertex-fog.md.
